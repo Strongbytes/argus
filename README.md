@@ -12,7 +12,9 @@ JSON.
 import argus
 from agents import Agent, Runner   # OpenAI Agents SDK
 
-argus.init("openai")               # auto-detects framework, flushes on exit
+argus.init("my_project_name")      # "my_project_name" is the project name; the
+                                   # framework is auto-detected and traces
+                                   # flush on exit
 
 # ... run your agent ...
 ```
@@ -30,34 +32,45 @@ The package is named `argus-trace` and imported as `argus`. Install it with
 pip install "argus-trace[openai-agents]"   # OpenAI Agents SDK
 pip install "argus-trace[claude]"          # Claude Agent SDK
 pip install "argus-trace[agno]"            # Agno
-pip install "argus-trace[otlp]"            # remote OTLP/HTTP exporter
+pip install "argus-trace[otlp]"            # deps for a remote OTLP/HTTP exporter
 ```
 
 The bare `pip install argus-trace` pulls only the thin core (OpenTelemetry +
 `python-dotenv`); instrumentors are optional so Argus stays lightweight.
 
-For local development, install from a checkout in editable mode:
+The `[otlp]` extra installs the OpenTelemetry OTLP exporter package so you can
+construct your own exporter and pass it via `exporters=` (see the roadmap for
+planned built-in support).
+
+## Local development
+
+To work on Argus itself, install from a checkout in editable mode. The dev
+requirements pull in an editable install of the package plus the formatting
+tools:
 
 ```bash
-pip install -e .            # core
-pip install -r requirements-dev.txt   # editable install + formatting tools
+pip install -r requirements-dev.txt   # editable install (-e .) + black + isort
 ```
+
+Install the relevant `[…]` extra from above as well if you want to exercise a
+particular instrumentor locally.
 
 ## `argus.init(...)`
 
-| Argument      | Default          | Notes |
-| ------------- | ---------------- | ----- |
-| `project`     | (required)       | Traces sub-directory and `service.name` on every span. |
-| `instrument`  | `None`           | `None` = curated auto-detection; `"auto"` = entry-point discovery; a key or list of keys (`"openai_agents"`, `["agno"]`). |
-| `output_dir`  | `<cwd>/traces`   | Directory traces are written to. |
-| `exporters`   | `[FileSpanExporter]` | Swap in your own OpenTelemetry exporters (e.g. OTLP). |
-| `load_dotenv` | `True`           | Load a `.env` found from the working directory. |
+| Argument      | Default              | Notes                                                                                                                                |
+| ------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `project`     | (required)           | Argus's logical run umbrella; stamped onto every span as `argus.project`. May span several services.                                 |
+| `service`     | script name          | Observed app identity; stamped as OpenTelemetry `service.name`. Defaults to the running script's name.                               |
+| `instrument`  | `None`               | `None`/`"curated"` = curated auto-detection; `"all"` = entry-point discovery; a key or list of keys (`"openai_agents"`, `["agno"]`). |
+| `output_dir`  | `<cwd>/traces`       | Directory traces are written to.                                                                                                     |
+| `exporters`   | `[FileSpanExporter]` | Swap in your own OpenTelemetry exporters (e.g. OTLP).                                                                                |
+| `load_dotenv` | `True`               | Load a `.env` found from the working directory.                                                                                      |
 
 `init` returns a `Session` that flushes automatically via `atexit`. It can also
 be used as a context manager for deterministic, scoped flushing:
 
 ```python
-with argus.init("openai"):
+with argus.init("my_project_name"):
     run_my_agent()
 ```
 
@@ -66,14 +79,14 @@ with argus.init("openai"):
 By default Argus uses a curated registry, detecting the framework actually in
 use (preferring already-imported modules) and avoiding double-instrumentation:
 
-| Key             | Detected via       | Instrumentors |
-| --------------- | ------------------ | ------------- |
-| `openai_agents` | `agents`           | `OpenAIAgentsInstrumentor` |
-| `claude`        | `claude_agent_sdk` | `ClaudeAgentSDKInstrumentor` |
+| Key             | Detected via       | Instrumentors                             |
+| --------------- | ------------------ | ----------------------------------------- |
+| `openai_agents` | `agents`           | `OpenAIAgentsInstrumentor`                |
+| `claude`        | `claude_agent_sdk` | `ClaudeAgentSDKInstrumentor`              |
 | `agno`          | `agno`             | `AgnoInstrumentor` + `OpenAIInstrumentor` |
-| `openai`        | `openai`           | `OpenAIInstrumentor` |
+| `openai`        | `openai`           | `OpenAIInstrumentor`                      |
 
-Pass `instrument="auto"` to instead load every instrumentor registered under
+Pass `instrument="all"` to instead load every instrumentor registered under
 the `openinference_instrumentor` entry-point group.
 
 ## Roadmap

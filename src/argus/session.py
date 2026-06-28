@@ -1,4 +1,27 @@
-"""The Argus front door: :func:`init` and the :class:`Session` it returns."""
+"""The Argus front door: :func:`init` and the :class:`Session` it returns.
+
+Everything a user does with Argus flows through here. :func:`init` is the one
+call they make: it wires up an OpenTelemetry :class:`TracerProvider`, attaches
+the exporter(s), turns on the auto-detected instrumentor(s), and hands back a
+:class:`Session`. The :class:`Session` owns the run's tracing state and knows
+how to flush it.
+
+The central design goal is **zero-ceremony capture**: a user should be able to
+add a single ``argus.init(...)`` line and get a complete, correctly-labelled
+trace on disk -- even if they never call anything else and even if their script
+crashes. Two module-level mechanisms make that possible:
+
+* An ``atexit`` hook (:func:`_flush_active_sessions`) flushes every session on
+  process exit, so the common case needs no context manager and no explicit
+  flush call.
+* An ``excepthook`` wrapper (:func:`_install_excepthook`) records whether the
+  run died from an unhandled exception. That flag is what lets the on-exit
+  flush tag a crashed run as failed without the user opting in.
+
+For callers who want deterministic, scoped flushing instead, :class:`Session`
+doubles as a context manager -- and because flushing is guarded to run exactly
+once, using the context manager and the ``atexit`` hook together is harmless.
+"""
 
 from __future__ import annotations
 
@@ -44,12 +67,23 @@ def _install_excepthook() -> None:
 
 
 def _detect_script_name() -> str:
+    """Best-effort name for the running script, used to label trace files.
+
+    Derived from the ``__main__`` module's filename (e.g. ``my_agent.py`` ->
+    ``my_agent``). Falls back to ``"session"`` when there is no file to read,
+    such as an interactive REPL or an embedded interpreter.
+    """
     main = sys.modules.get("__main__")
     path = getattr(main, "__file__", None)
     return Path(path).stem if path else "session"
 
 
 def _load_dotenv() -> None:
+    """Load a ``.env`` from the working directory, if python-dotenv is present.
+
+    Quietly does nothing when ``python-dotenv`` isn't installed, keeping the
+    dependency genuinely optional.
+    """
     try:
         from dotenv import find_dotenv, load_dotenv
     except ModuleNotFoundError:
@@ -66,7 +100,7 @@ class Session:
     session and an ``atexit`` hook flushes it on process exit. It also works as
     a context manager when you want deterministic, scoped flushing::
 
-        with argus.init("openai"):
+        with argus.init("my_project_name"):
             run_my_agent()
     """
 
@@ -77,6 +111,14 @@ class Session:
         instruments: Sequence[str],
         project: str,
     ) -> None:
+        """Store the run's tracing state.
+
+        Built by :func:`init`, not directly. Most arguments are what they say;
+        the two worth noting are ``exporters`` (the sinks :meth:`flush` drives
+        on exit) and ``instruments`` (instrumentor *names*, kept only for
+        introspection). ``_flushed`` is the guard that makes :meth:`flush`
+        idempotent.
+        """
         self.provider = provider
         self.exporters = list(exporters)
         self.instruments = list(instruments)
@@ -99,9 +141,15 @@ class Session:
                 write_to_disk(failed=is_failed)
 
     def __enter__(self) -> "Session":
+        """Enter the context manager, returning the session itself."""
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
+        """Flush on scope exit, tagging failure if the block raised.
+
+        Returns ``False`` so any exception from the ``with`` block propagates
+        normally rather than being swallowed.
+        """
         self.flush(failed=exc_type is not None)
         return False
 
@@ -109,6 +157,7 @@ class Session:
 def init(
     project: str,
     *,
+    service: Optional[str] = None,
     instrument: Union[str, Sequence[str], None] = None,
     output_dir: Union[str, Path, None] = None,
     exporters: Optional[Sequence[SpanExporter]] = None,
@@ -117,11 +166,15 @@ def init(
     """Configure tracing and turn on the right instrumentor(s).
 
     Args:
-        project: Logical name for the run; used as the traces sub-directory and
-            stamped onto every span as ``service.name``.
-        instrument: ``None`` for curated auto-detection (default), ``"auto"``
-            for entry-point discovery, or a key / list of keys
-            (e.g. ``"openai_agents"``, ``["agno"]``).
+        project: Argus's logical run umbrella, stamped on every span as
+            ``argus.project``. A project may span several services.
+        service: Identity of the observed application, stamped as the
+            OpenTelemetry ``service.name``. Defaults to the running script's
+            name, so standard OTel backends group traces by the app that
+            produced them rather than by Argus.
+        instrument: ``None``/``"curated"`` for curated auto-detection
+            (default), ``"all"`` for entry-point discovery, or a key / list of
+            keys (e.g. ``"openai_agents"``, ``["agno"]``).
         output_dir: Directory traces are written to. Defaults to
             ``<cwd>/traces``.
         exporters: Custom span exporters. Defaults to a single
@@ -135,9 +188,21 @@ def init(
     if load_dotenv:
         _load_dotenv()
 
-    base_dir = Path(output_dir) if output_dir is not None else default_traces_dir()
+    base_dir = (
+        Path(output_dir) if output_dir is not None else default_traces_dir()
+    )
+    # service.name (OTel convention) identifies the observed app; argus.project
+    # is Argus's own grouping; argus.version records the tool that produced the
+    # trace. Keeping them distinct lets standard backends group by app while
+    # Argus keys off a namespace nobody else touches.
+    from . import __version__ as argus_version
+
     resource = Resource.create(
-        {"service.name": project, "argus.project": project}
+        {
+            "service.name": service or _detect_script_name(),
+            "argus.project": project,
+            "argus.version": argus_version,
+        }
     )
     provider = TracerProvider(resource=resource)
 
@@ -165,6 +230,12 @@ def init(
 
 @atexit.register
 def _flush_active_sessions() -> None:
+    """Flush every registered session on process exit.
+
+    Registered with ``atexit`` so traces are persisted without the caller
+    lifting a finger. Exceptions are swallowed per-session: a failure to write
+    one trace must never crash interpreter shutdown or block the others.
+    """
     for session in _active_sessions:
         try:
             session.flush()

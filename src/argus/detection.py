@@ -6,7 +6,7 @@ Two strategies are supported:
   instrumentor(s) it needs, detected by whether the framework is actually in
   use. This is predictable and avoids double-instrumenting (e.g. it won't add
   the standalone OpenAI instrumentor on top of the OpenAI Agents one).
-* **Entry-point discovery (opt-in via ``instrument="auto"``).** Loads every
+* **Entry-point discovery (opt-in via ``instrument="all"``).** Loads every
   instrumentor registered under the ``openinference_instrumentor`` entry-point
   group. New instrumentors light up with no code change, at the cost of
   possibly instrumenting more than intended in a multi-framework environment.
@@ -44,12 +44,16 @@ _FRAMEWORKS: tuple[_Framework, ...] = (
     _Framework(
         "openai_agents",
         "agents",
-        ("openinference.instrumentation.openai_agents:OpenAIAgentsInstrumentor",),
+        (
+            "openinference.instrumentation.openai_agents:OpenAIAgentsInstrumentor",
+        ),
     ),
     _Framework(
         "claude",
         "claude_agent_sdk",
-        ("openinference.instrumentation.claude_agent_sdk:ClaudeAgentSDKInstrumentor",),
+        (
+            "openinference.instrumentation.claude_agent_sdk:ClaudeAgentSDKInstrumentor",
+        ),
     ),
     _Framework(
         "agno",
@@ -73,15 +77,31 @@ _OPENAI_SUPERSEDERS = {"openai_agents", "agno"}
 
 
 def _load(path: str):
+    """Import and return the attribute named by a ``"module:attr"`` path.
+
+    This is the lazy-import seam: instrumentor classes are only imported when a
+    framework is actually selected, so an unused optional dependency never has
+    to be importable.
+    """
     module_path, _, attr = path.partition(":")
     return getattr(import_module(module_path), attr)
 
 
 def _module_loaded(name: str) -> bool:
+    """Return whether ``name`` has already been imported in this process.
+
+    A cheap ``sys.modules`` membership check -- it never triggers an import,
+    so it reflects what the current script chose to bring in.
+    """
     return name in sys.modules
 
 
 def _module_available(name: str) -> bool:
+    """Return whether ``name`` is importable, without importing it.
+
+    Used as the fallback signal when nothing relevant is loaded yet. The broad
+    ``except`` covers oddly-packaged modules whose spec lookup itself raises.
+    """
     try:
         return find_spec(name) is not None
     except (ImportError, ValueError):
@@ -106,6 +126,12 @@ def _auto_keys() -> list[str]:
 
 
 def _entry_point_classes() -> list[type]:
+    """Load every instrumentor advertised under the entry-point group.
+
+    Backs ``instrument="all"``: any package that registers itself lights up
+    with no code change here. A broken or incompatible instrumentor is skipped
+    rather than allowed to abort the run.
+    """
     from importlib.metadata import entry_points
 
     classes: list[type] = []
@@ -119,6 +145,12 @@ def _entry_point_classes() -> list[type]:
 
 
 def _classes_for_keys(keys: Iterable[str]) -> list[type]:
+    """Resolve curated registry keys to their instrumentor classes.
+
+    Raises:
+        ValueError: If a key isn't in the curated registry, with the set of
+            known keys to guide the fix.
+    """
     classes: list[type] = []
     for key in keys:
         framework = _BY_KEY.get(key)
@@ -137,14 +169,17 @@ def resolve_instrumentors(
 ) -> list:
     """Return instantiated instrumentors for the requested selection.
 
-    * ``None``  -> curated auto-detection (default)
-    * ``"auto"`` -> entry-point discovery
-    * ``str``   -> a single registry key (e.g. ``"openai_agents"``)
-    * sequence  -> explicit list of registry keys
+    * ``None`` / ``"curated"``  -> curated auto-detection (default)
+    * ``"all"``                 -> entry-point discovery
+    * ``str``                   -> a single registry key (e.g. ``"openai_agents"``)
+    * ``Sequence[str]``         -> explicit list of registry keys
+
+    ``None`` is accepted as a synonym for ``"curated"`` so the bare
+    ``init(project)`` does the auto-detection.
     """
-    if instrument == "auto":
+    if instrument == "all":
         classes = _entry_point_classes()
-    elif instrument is None:
+    elif instrument is None or instrument == "curated":
         classes = _classes_for_keys(_auto_keys())
     elif isinstance(instrument, str):
         classes = _classes_for_keys([instrument])

@@ -8,10 +8,17 @@ spans to disk as readable JSON.
 Typical usage::
 
     import argus
-    argus.init("openai")  # auto-detects the framework, flushes on exit
+    argus.init("my_project_name")  # auto-detects the framework, flushes on exit
 """
+
+from importlib.metadata import PackageNotFoundError, version
 
 from .session import Session, init
 
+try:
+    __version__ = version("argus-trace")
+except PackageNotFoundError:
+    # Running from a source tree without installed metadata.
+    __version__ = "0.0.0+unknown"
+
 __all__ = ["init", "Session"]
-__version__ = "0.1.0"
