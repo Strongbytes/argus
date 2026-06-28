@@ -1,0 +1,5 @@
+# Development dependencies for working on Argus itself.
+# Installs the package in editable mode plus the formatting tools.
+-e .
+black==25.1.0
+isort==6.0.1

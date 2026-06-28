@@ -1,0 +1,6 @@
+# Core runtime dependencies for Argus.
+# These mirror the [project.dependencies] in pyproject.toml; the optional
+# framework instrumentors are installed via extras (see the README), e.g.
+#   pip install "argus-trace[openai-agents]"
+opentelemetry-sdk==1.43.0
+python-dotenv==1.2.2

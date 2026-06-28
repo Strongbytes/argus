@@ -1,0 +1,37 @@
+[project]
+name = "argus-trace"
+version = "0.1.0"
+description = "A thin wrapper over OpenInference + OpenTelemetry that captures LLM agent traces to disk (and, later, to a remote endpoint)."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "opentelemetry-sdk>=1.30",
+    "python-dotenv>=1.0",
+]
+
+# The OpenInference instrumentors and the agent SDKs are optional: Argus only
+# touches an instrumentor when its target library is installed, which keeps the
+# core wrapper genuinely thin. Install the extra that matches your stack.
+[project.optional-dependencies]
+openai-agents = ["openinference-instrumentation-openai-agents"]
+claude = ["openinference-instrumentation-claude-agent-sdk"]
+agno = [
+    "openinference-instrumentation-agno",
+    "openinference-instrumentation-openai",
+]
+otlp = ["opentelemetry-exporter-otlp-proto-http>=1.30"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 80
+target-version = ['py310']
+
+[tool.isort]
+profile = "black"
+line_length = 80
