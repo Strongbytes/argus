@@ -49,11 +49,31 @@ requirements pull in an editable install of the package plus the formatting
 tools:
 
 ```bash
-pip install -r requirements-dev.txt   # editable install (-e .) + black + isort
+pip install -r requirements-dev.txt   # editable install (-e .) + black + isort + pytest + pytest-cov
 ```
 
 Install the relevant `[…]` extra from above as well if you want to exercise a
 particular instrumentor locally.
+
+### Running the tests
+
+Run the suite with `pytest` from the repo root:
+
+```bash
+pytest
+```
+
+The tests use lightweight fakes for the instrumentors and exporters (see
+`tests/factories.py`), so no agent-framework extras are required to run them.
+
+Coverage is opt-in. Pass `--cov` to get a terminal report (the measured
+package and the `term-missing` output are preconfigured in `pyproject.toml`, so
+the bare flag is enough):
+
+```bash
+pytest --cov                       # terminal report with missing lines
+pytest --cov --cov-report=html     # also write an htmlcov/ report to browse
+```
 
 ## `argus.init(...)`
 

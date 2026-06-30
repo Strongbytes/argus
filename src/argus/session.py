@@ -11,7 +11,7 @@ add a single ``argus.init(...)`` line and get a complete, correctly-labelled
 trace on disk -- even if they never call anything else and even if their script
 crashes. Two module-level mechanisms make that possible:
 
-* An ``atexit`` hook (:func:`_flush_active_sessions`) flushes every session on
+* An ``atexit`` hook (:func:`_flush_on_exit`) flushes the active session on
   process exit, so the common case needs no context manager and no explicit
   flush call.
 * An ``excepthook`` wrapper (:func:`_install_excepthook`) records whether the
@@ -27,8 +27,9 @@ from __future__ import annotations
 
 import atexit
 import sys
+import warnings
 from pathlib import Path
-from typing import List, Optional, Sequence, Union
+from typing import Optional, Sequence, Union
 
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
@@ -38,12 +39,40 @@ from .detection import resolve_instrumentors
 from .exporters.file import FileSpanExporter
 from .paths import default_traces_dir
 
-# Sessions opened in this process, flushed once on exit.
-_active_sessions: "List[Session]" = []
+# The single session for this process. Argus is intentionally a per-process
+# singleton: instrumentors are global, so a second provider can never reliably
+# receive spans for an already-instrumented framework. ``init`` enforces this.
+_session: "Optional[Session]" = None
 # Flipped by our excepthook when the run dies with an unhandled exception, so
 # the atexit flush can tag the trace as a failure.
 _run_failed = False
 _excepthook_installed = False
+
+
+def _warn_reinit(existing: "Session", project: str) -> None:
+    """Warn that Argus is already initialized and this call is being ignored.
+
+    Emitted as a :class:`RuntimeWarning` rather than raised so a stray second
+    ``init`` never crashes the host program -- the same forgiving stance
+    OpenTelemetry's own ``set_tracer_provider`` takes. Callers who *want* the
+    strict, fail-fast behavior can promote it with ``python -W error``.
+    """
+    if project != existing.project:
+        detail = (
+            f" (already initialized for project {existing.project!r}; "
+            f"ignoring new project {project!r})"
+        )
+    else:
+        detail = f" (already initialized for project {existing.project!r})"
+    warnings.warn(
+        "argus.init() has already been called"
+        + detail
+        + "; returning the existing session and ignoring this call. To trace "
+        "multiple frameworks, list them in a single init, e.g. "
+        'argus.init(project, instrument=["openai_agents", "claude"]).',
+        RuntimeWarning,
+        stacklevel=3,
+    )
 
 
 def _install_excepthook() -> None:
@@ -108,20 +137,22 @@ class Session:
         self,
         provider: TracerProvider,
         exporters: Sequence[SpanExporter],
-        instruments: Sequence[str],
+        instrumentors: Sequence[object],
         project: str,
     ) -> None:
         """Store the run's tracing state.
 
         Built by :func:`init`, not directly. Most arguments are what they say;
         the two worth noting are ``exporters`` (the sinks :meth:`flush` drives
-        on exit) and ``instruments`` (instrumentor *names*, kept only for
-        introspection). ``_flushed`` is the guard that makes :meth:`flush`
-        idempotent.
+        on exit) and ``instrumentors`` (the live instrumentor *instances*,
+        retained so the session can be torn down via :func:`_reset`).
+        ``instruments`` exposes their class names for introspection, and
+        ``_flushed`` is the guard that makes :meth:`flush` idempotent.
         """
         self.provider = provider
         self.exporters = list(exporters)
-        self.instruments = list(instruments)
+        self.instrumentors = list(instrumentors)
+        self.instruments = [type(i).__name__ for i in self.instrumentors]
         self.project = project
         self._flushed = False
 
@@ -184,7 +215,18 @@ def init(
 
     Returns:
         A :class:`Session`; traces flush automatically on process exit.
+
+    Calling ``init`` more than once in a process is a no-op: it warns and
+    returns the already-active :class:`Session` unchanged. Because
+    instrumentors are global singletons a second provider could not reliably
+    capture spans anyway, so to trace several frameworks pass them all in one
+    call (e.g. ``instrument=["openai_agents", "claude"]``).
     """
+    global _session
+    if _session is not None:
+        _warn_reinit(_session, project)
+        return _session
+
     if load_dotenv:
         _load_dotenv()
 
@@ -220,25 +262,52 @@ def init(
     session = Session(
         provider=provider,
         exporters=exporters,
-        instruments=[type(i).__name__ for i in instances],
+        instrumentors=instances,
         project=project,
     )
     _install_excepthook()
-    _active_sessions.append(session)
+    _session = session
     return session
 
 
+def _reset() -> None:
+    """Tear down the active session so a fresh :func:`init` can run.
+
+    Intended for tests and interactive (REPL/notebook) re-runs, where the
+    per-process singleton would otherwise pin the first configuration in place.
+    Uninstruments the live instrumentors (so the next ``init`` can re-wire them
+    to a new provider), drops the session, and clears the failure flag.
+
+    It deliberately does *not* flush -- call :meth:`Session.flush` first if you
+    still want the buffered traces. The excepthook wrapper is left installed; it
+    is idempotent and harmless to keep.
+    """
+    global _session, _run_failed
+    if _session is not None:
+        for instrumentor in _session.instrumentors:
+            uninstrument = getattr(instrumentor, "uninstrument", None)
+            if callable(uninstrument):
+                try:
+                    uninstrument()
+                except Exception:
+                    # A failed teardown must not block the reset.
+                    pass
+    _session = None
+    _run_failed = False
+
+
 @atexit.register
-def _flush_active_sessions() -> None:
-    """Flush every registered session on process exit.
+def _flush_on_exit() -> None:
+    """Flush the active session on process exit.
 
     Registered with ``atexit`` so traces are persisted without the caller
-    lifting a finger. Exceptions are swallowed per-session: a failure to write
-    one trace must never crash interpreter shutdown or block the others.
+    lifting a finger. Exceptions are swallowed: a failure to write the trace
+    must never crash interpreter shutdown.
     """
-    for session in _active_sessions:
-        try:
-            session.flush()
-        except Exception:
-            # Never let trace flushing crash interpreter shutdown.
-            pass
+    if _session is None:
+        return
+    try:
+        _session.flush()
+    except Exception:
+        # Never let trace flushing crash interpreter shutdown.
+        pass

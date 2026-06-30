@@ -35,3 +35,24 @@ target-version = ['py310']
 [tool.isort]
 profile = "black"
 line_length = 80
+# The test suite is a package imported as ``tests.*``; classify it as local so
+# its imports don't get grouped with third-party packages.
+known_local_folder = ["tests"]
+
+[tool.pytest.ini_options]
+# Put the project root on sys.path so the ``tests`` package (and its shared
+# helpers, imported as ``tests.factories``) resolves regardless of import mode.
+pythonpath = ["."]
+testpaths = ["tests"]
+# Surface our re-init RuntimeWarning loudly in the suite, and let individual
+# tests assert on it explicitly via pytest.warns / filterwarnings markers.
+filterwarnings = ["always"]
+
+# Coverage is opt-in (run ``pytest --cov``); the source and reporting defaults
+# below mean that single flag is enough -- no need to repeat ``--cov=argus``.
+[tool.coverage.run]
+source = ["argus"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
