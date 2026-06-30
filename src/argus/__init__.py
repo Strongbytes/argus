@@ -13,6 +13,7 @@ Typical usage::
 
 from importlib.metadata import PackageNotFoundError, version
 
+from .blindspot import blindspot
 from .session import Session, init
 
 try:
@@ -21,4 +22,4 @@ except PackageNotFoundError:
     # Running from a source tree without installed metadata.
     __version__ = "0.0.0+unknown"
 
-__all__ = ["init", "Session"]
+__all__ = ["init", "Session", "blindspot"]

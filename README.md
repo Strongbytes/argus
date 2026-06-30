@@ -94,6 +94,37 @@ with argus.init("my_project_name"):
     run_my_agent()
 ```
 
+## Excluding code from tracing (`argus.blindspot`)
+
+Argus records everything by default. When a particular workflow -- or a slice
+of one -- should stay off the record (secrets, PII, or just noise), wrap it in
+a `blindspot`. Inside the scope no spans are created at all: suppression happens
+at the source, so nothing is buffered or written.
+
+It works as a context manager (sync or async) and as a decorator on either
+kind of function:
+
+```python
+import argus
+
+argus.init("my_project_name")
+
+with argus.blindspot():            # synchronous block
+    run_sensitive_step()
+
+async with argus.blindspot():      # asynchronous block
+    await run_sensitive_step()
+
+@argus.blindspot()                 # whole function, sync or async
+def internal_workflow(...):
+    ...
+```
+
+The suppression rides on the active context, so it follows `await` points and
+copies into tasks spawned inside the block. It does **not** reach threads you
+start yourself (a raw `threading.Thread` or a `ThreadPoolExecutor`), which begin
+from a fresh context unless you explicitly copy it.
+
 ## Instrumentor detection
 
 By default Argus uses a curated registry, detecting the framework actually in
