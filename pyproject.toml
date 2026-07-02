@@ -28,6 +28,19 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# Version bumps are derived from Conventional Commit messages, not chosen by
+# hand: run ``cz bump`` on demand and Commitizen scans the commits since the
+# last ``v*`` tag, computes the next version, rewrites ``[project].version``,
+# updates CHANGELOG.md, and creates the tag. ``major_version_zero`` keeps us on
+# the pre-1.0 (0.x) semver track -- breaking changes bump the minor, features
+# bump the patch -- until we deliberately cut 1.0.0 with ``cz bump 1.0.0``.
+[tool.commitizen]
+name = "cz_conventional_commits"
+version_provider = "pep621"
+tag_format = "v$version"
+update_changelog_on_bump = true
+major_version_zero = true
+
 [tool.black]
 line-length = 80
 target-version = ['py310']
