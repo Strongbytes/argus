@@ -57,6 +57,44 @@ class TestWriteToDisk:
         (spans,) = _load_all(traces_dir).values()
         assert spans[0]["output"] == {"k": 1}
 
+    def test_spans_written_in_generation_order(self, traces_dir):
+        # Spans arrive end-time-first (leaf before the parent that wraps it),
+        # so the parent -- started first -- shows up last on the wire.
+        exporter = FileSpanExporter(traces_dir, script_name="s")
+        exporter.export(
+            [
+                make_span(
+                    trace_id=1,
+                    name="leaf",
+                    start_time="2026-07-06T17:00:00.500000Z",
+                ),
+                make_span(
+                    trace_id=1,
+                    name="root",
+                    start_time="2026-07-06T17:00:00.000000Z",
+                ),
+            ]
+        )
+
+        exporter.write_to_disk()
+
+        (spans,) = _load_all(traces_dir).values()
+        assert [span["name"] for span in spans] == ["root", "leaf"]
+
+    def test_spans_without_start_time_keep_arrival_order(self, traces_dir):
+        exporter = FileSpanExporter(traces_dir, script_name="s")
+        exporter.export(
+            [
+                make_span(trace_id=1, name="first"),
+                make_span(trace_id=1, name="second"),
+            ]
+        )
+
+        exporter.write_to_disk()
+
+        (spans,) = _load_all(traces_dir).values()
+        assert [span["name"] for span in spans] == ["first", "second"]
+
 
 class TestMisc:
     def test_creates_base_dir_with_parents(self, tmp_path):

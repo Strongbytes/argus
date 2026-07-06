@@ -98,16 +98,37 @@ class FileSpanExporter(SpanExporter):
             )
         return SpanExportResult.SUCCESS
 
+    @staticmethod
+    def _in_generation_order(spans: list[dict]) -> list[dict]:
+        """Return ``spans`` ordered by when each was generated (started).
+
+        Spans arrive from ``export`` in *end-time* order -- a leaf finishes
+        before the parent that wraps it -- so the buffer reads roughly
+        backwards, with the earliest-started (root) span landing last. We
+        restore the run's original chronology by sorting on the ``start_time``
+        stamped by OpenTelemetry (an ISO-8601 UTC string, hence directly
+        comparable). Sorting on the real timestamp rather than blindly
+        reversing keeps siblings and concurrent work correctly ordered.
+
+        The sort is stable and tolerates spans without a ``start_time`` (they
+        keep their relative arrival order), so nothing is lost if the field is
+        ever absent.
+        """
+        return sorted(spans, key=lambda span: span.get("start_time") or "")
+
     def write_to_disk(self, failed: bool = False) -> None:
         """Persist all buffered traces, one indented JSON file per trace.
 
         ``failed`` tags the run's outcome in the filename so a partial/errored
         run is still captured (and obvious) rather than silently discarded.
+        Spans within each trace are written in generation order (see
+        :meth:`_in_generation_order`) so the file reads top-to-bottom as the
+        run unfolded.
         """
         for trace_id, spans in self._trace_spans.items():
             path = self._file_for_trace(trace_id, failed)
             with path.open("w", encoding="utf-8") as handle:
-                json.dump(spans, handle, indent=2)
+                json.dump(self._in_generation_order(spans), handle, indent=2)
                 handle.write("\n")
 
     def force_flush(self, timeout_millis: int = 30_000) -> bool:
