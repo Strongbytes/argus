@@ -1,3 +1,9 @@
+## v0.1.2 (2026-07-08)
+
+### Fix
+
+- name convention for file exporter to windows compat
+
 ## v0.1.1 (2026-07-06)
 
 ### Fix
