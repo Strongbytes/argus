@@ -69,7 +69,7 @@ class FileSpanExporter(SpanExporter):
         calls for the same trace return a stable path.
         """
         if trace_id not in self._trace_files:
-            timestamp = datetime.now(timezone.utc).strftime("%d-%m-%y_%H:%M:%S")
+            timestamp = datetime.now(timezone.utc).strftime("%d-%m-%y_%H-%M-%S")
             outcome = ".error" if failed else ""
             base_name = f"{timestamp}_{self._script_name}{outcome}"
             path = self._base_dir / f"{base_name}.json"
