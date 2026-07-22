@@ -26,18 +26,63 @@ once, using the context manager and the ``atexit`` hook together is harmless.
 from __future__ import annotations
 
 import atexit
+import os
 import sys
 import warnings
 from pathlib import Path
 from typing import Optional, Sequence, Union
 
 from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace import SpanLimits, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor, SpanExporter
 
 from .detection import resolve_instrumentors
 from .exporters.file import FileSpanExporter
 from .paths import default_traces_dir
+
+# OpenTelemetry caps span attributes at 128 by default. OpenInference flattens
+# every chat message into several attributes (role, content, each tool call's
+# id/name/arguments, ...), so a long agent conversation blows past 128 and the
+# SDK silently evicts the oldest attributes -- which, given the order
+# OpenInference writes them, includes the model's final output message. We raise
+# the ceiling far past any realistic run while keeping a rail against a
+# pathological one. At roughly three attributes per chat message this holds on
+# the order of ten-thousand messages in a single span.
+#
+# This is deliberately not exposed as an ``init`` argument: choosing it well
+# requires knowing OpenInference's per-message flattening, and a too-low value
+# fails silently (the oldest attributes, including the model's output, are
+# dropped with no error). The standard OpenTelemetry env var remains the escape
+# hatch for the rare caller who must tune it.
+_DEFAULT_MAX_SPAN_ATTRIBUTES = 50_000
+_SPAN_ATTRIBUTE_COUNT_ENV_VAR = "OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT"
+
+
+def _resolve_span_limits() -> SpanLimits:
+    """Build span limits that raise the attribute ceiling past OTel's default.
+
+    Honors the standard ``OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT`` when set (an empty
+    value means "no limit", matching OpenTelemetry), and otherwise applies
+    Argus's raised default. Only the span attribute *count* is touched; every
+    other limit keeps its OpenTelemetry default.
+    """
+    raw = os.environ.get(_SPAN_ATTRIBUTE_COUNT_ENV_VAR)
+    if raw is None:
+        cap: Optional[int] = _DEFAULT_MAX_SPAN_ATTRIBUTES
+    else:
+        raw = raw.strip()
+        try:
+            # Empty string is OTel's spelling of "unlimited"; a non-negative
+            # int is an explicit cap. Anything else falls back to our default.
+            cap = None if raw == "" else int(raw)
+        except ValueError:
+            cap = _DEFAULT_MAX_SPAN_ATTRIBUTES
+        if cap is not None and cap < 0:
+            cap = _DEFAULT_MAX_SPAN_ATTRIBUTES
+    return SpanLimits(
+        max_span_attributes=SpanLimits.UNSET if cap is None else cap
+    )
+
 
 # The single session for this process. Argus is intentionally a per-process
 # singleton: instrumentors are global, so a second provider can never reliably
@@ -246,7 +291,9 @@ def init(
             "argus.version": argus_version,
         }
     )
-    provider = TracerProvider(resource=resource)
+    provider = TracerProvider(
+        resource=resource, span_limits=_resolve_span_limits()
+    )
 
     if exporters is None:
         exporters = [

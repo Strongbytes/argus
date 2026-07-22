@@ -54,6 +54,81 @@ class TestInit:
         assert attributes["argus.version"] == argus.__version__
 
 
+class TestSpanLimits:
+    """The raised span attribute ceiling and its env-var escape hatch.
+
+    OpenTelemetry drops a span's oldest attributes once it exceeds 128, which
+    silently loses the model's output on long conversations (OpenInference
+    flattens each message into several attributes). Argus raises that ceiling.
+    """
+
+    ENV = session_module._SPAN_ATTRIBUTE_COUNT_ENV_VAR
+    DEFAULT = session_module._DEFAULT_MAX_SPAN_ATTRIBUTES
+
+    def test_default_raises_ceiling_when_env_absent(self, monkeypatch):
+        monkeypatch.delenv(self.ENV, raising=False)
+
+        limits = session_module._resolve_span_limits()
+
+        assert limits.max_span_attributes == self.DEFAULT
+
+    def test_env_var_overrides_default(self, monkeypatch):
+        monkeypatch.setenv(self.ENV, "8000")
+
+        limits = session_module._resolve_span_limits()
+
+        assert limits.max_span_attributes == 8000
+
+    def test_empty_env_var_means_unlimited(self, monkeypatch):
+        monkeypatch.setenv(self.ENV, "")
+
+        limits = session_module._resolve_span_limits()
+
+        assert limits.max_span_attributes is None
+
+    @pytest.mark.parametrize("value", ["garbage", "-5"])
+    def test_invalid_env_var_falls_back_to_default(self, monkeypatch, value):
+        monkeypatch.setenv(self.ENV, value)
+
+        limits = session_module._resolve_span_limits()
+
+        assert limits.max_span_attributes == self.DEFAULT
+
+    def test_init_provider_carries_raised_limit(
+        self, monkeypatch, use_instrumentors, recording_exporter
+    ):
+        monkeypatch.delenv(self.ENV, raising=False)
+        use_instrumentors()
+
+        session = argus.init(
+            "proj", exporters=[recording_exporter], load_dotenv=False
+        )
+
+        assert (
+            session.provider._span_limits.max_span_attributes == self.DEFAULT
+        )
+
+    def test_provider_retains_attributes_past_otel_default(
+        self, monkeypatch, use_instrumentors, recording_exporter
+    ):
+        # The regression guard: a span with far more than OTel's default of
+        # 128 attributes must keep every one, so a long agent conversation
+        # never loses its final output message to silent truncation.
+        monkeypatch.delenv(self.ENV, raising=False)
+        use_instrumentors()
+        session = argus.init(
+            "proj", exporters=[recording_exporter], load_dotenv=False
+        )
+
+        span = session.provider.get_tracer("test").start_span("response")
+        for i in range(200):
+            span.set_attribute(f"llm.input_messages.{i}.message.role", "tool")
+        span.end()
+
+        assert len(span.attributes) == 200
+        assert span.dropped_attributes == 0
+
+
 class TestReinitGuard:
     def test_second_init_warns_and_returns_existing(
         self, use_instrumentors, recording_exporter

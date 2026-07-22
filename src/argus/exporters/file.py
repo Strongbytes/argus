@@ -13,10 +13,12 @@ on process exit, when the run's final outcome is known.
 
 Knowing the outcome up front is what lets the *filename* carry it: a healthy
 run lands at ``<timestamp>_<script>.json`` while a run that died on an
-unhandled exception is tagged ``<timestamp>_<script>.error.json``. Failed runs
-are therefore obvious at a glance in a directory listing and never silently
-discarded. Each distinct trace gets its own file, and a collision guard keeps
-two traces from the same second from clobbering one another.
+unhandled exception is tagged ``<timestamp>_<script>.error.json``. The
+timestamp is a UTC ``YYYY-MM-DD_HH-MM-SS`` stamp; the date-first layout also means a
+directory listing sorts chronologically. Failed runs are therefore obvious at
+a glance in a directory listing and never silently discarded. Each distinct
+trace gets its own file, and a collision guard keeps two traces from the same
+second from clobbering one another.
 
 The remaining methods (:meth:`~FileSpanExporter.force_flush` and
 :meth:`~FileSpanExporter.shutdown`) exist only to satisfy the
@@ -62,14 +64,15 @@ class FileSpanExporter(SpanExporter):
     def _file_for_trace(self, trace_id: int, failed: bool) -> Path:
         """Return the output path for ``trace_id``, allocating it on first use.
 
-        The name encodes the run timestamp, the script, and -- when ``failed``
-        -- an ``.error`` marker. A numeric suffix is appended if a sibling
-        trace from the same run/second already claimed the name, so concurrent
-        traces never overwrite each other. The result is memoized so repeated
-        calls for the same trace return a stable path.
+        The name encodes the run timestamp (a UTC ``YYYY-MM-DD_HH-MM-SS``
+        stamp), the script, and -- when ``failed`` -- an ``.error`` marker. A
+        numeric suffix is appended if a sibling trace from the same run/second
+        already claimed the name, so concurrent traces never overwrite each
+        other. The result is memoized so repeated calls for the same trace
+        return a stable path.
         """
         if trace_id not in self._trace_files:
-            timestamp = datetime.now(timezone.utc).strftime("%d-%m-%y_%H-%M-%S")
+            timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
             outcome = ".error" if failed else ""
             base_name = f"{timestamp}_{self._script_name}{outcome}"
             path = self._base_dir / f"{base_name}.json"

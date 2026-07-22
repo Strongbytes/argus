@@ -20,7 +20,7 @@ argus.init("my_project_name")      # "my_project_name" is the project name; the
 ```
 
 On process exit, spans are written under `traces/` as one indented JSON file per
-trace, named `DD-MM-YY_HH-MM-SS_<script>.json`. A run that ends in an unhandled
+trace, named `YYYY-MM-DD_HH-MM-SS_<script>.json`. A run that ends in an unhandled
 exception is still captured, tagged with a `.error.json` suffix.
 
 ## Installation
