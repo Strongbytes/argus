@@ -1,3 +1,9 @@
+## v0.2.0 (2026-07-22)
+
+### Feat
+
+- raise OTel's default args limit inside span
+
 ## v0.1.2 (2026-07-08)
 
 ### Fix
