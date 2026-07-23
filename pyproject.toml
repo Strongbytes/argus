@@ -1,6 +1,6 @@
 [project]
 name = "argus-trace"
-version = "0.2.0"
+version = "0.3.0"
 description = "A thin wrapper over OpenInference + OpenTelemetry that captures LLM agent traces to disk (and, later, to a remote endpoint)."
 readme = "README.md"
 requires-python = ">=3.10"
