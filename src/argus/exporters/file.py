@@ -8,8 +8,8 @@ OpenTelemetry hands spans to :meth:`~FileSpanExporter.export` as they end,
 incrementally and out of order, but at that moment we don't yet know how the
 run as a whole will turn out. So rather than streaming each span to disk, we
 accumulate them in memory, grouped by trace id, and defer the actual write to
-:meth:`~FileSpanExporter.write_to_disk`. Argus calls that method exactly once,
-on process exit, when the run's final outcome is known.
+:meth:`~FileSpanExporter.emit`. Argus calls that method exactly once, on
+process exit, when the run's final outcome is known.
 
 Knowing the outcome up front is what lets the *filename* carry it: a healthy
 run lands at ``<timestamp>_<script>.json`` while a run that died on an
@@ -23,7 +23,7 @@ second from clobbering one another.
 The remaining methods (:meth:`~FileSpanExporter.force_flush` and
 :meth:`~FileSpanExporter.shutdown`) exist only to satisfy the
 :class:`~opentelemetry.sdk.trace.export.SpanExporter` contract; because all the
-real work is deferred to ``write_to_disk`` they are intentionally no-ops.
+real work is deferred to ``emit`` they are intentionally no-ops.
 """
 
 from __future__ import annotations
@@ -91,8 +91,8 @@ class FileSpanExporter(SpanExporter):
         Called by OpenTelemetry as spans end. Each span is serialized to a
         plain dict (with any embedded JSON strings expanded for readability)
         and appended to its trace's buffer. Nothing touches disk here -- the
-        write is deferred to :meth:`write_to_disk` so the filename can reflect
-        the run's final outcome -- so this always reports success.
+        write is deferred to :meth:`emit` so the filename can reflect the run's
+        final outcome -- so this always reports success.
         """
         for span in spans:
             trace_id = span.context.trace_id
@@ -119,7 +119,7 @@ class FileSpanExporter(SpanExporter):
         """
         return sorted(spans, key=lambda span: span.get("start_time") or "")
 
-    def write_to_disk(self, failed: bool = False) -> None:
+    def emit(self, failed: bool = False) -> None:
         """Persist all buffered traces, one indented JSON file per trace.
 
         ``failed`` tags the run's outcome in the filename so a partial/errored
@@ -137,7 +137,7 @@ class FileSpanExporter(SpanExporter):
     def force_flush(self, timeout_millis: int = 30_000) -> bool:
         """Satisfy the ``SpanExporter`` interface; a no-op here.
 
-        Spans are held in memory until :meth:`write_to_disk`, so there is
+        Spans are held in memory until :meth:`emit`, so there is
         nothing to flush on demand. Always reports success.
 
         Args:
@@ -152,6 +152,6 @@ class FileSpanExporter(SpanExporter):
         """Satisfy the ``SpanExporter`` interface; a no-op here.
 
         The on-exit write is driven explicitly by Argus via
-        :meth:`write_to_disk`, so no resources need releasing at shutdown.
+        :meth:`emit`, so no resources need releasing at shutdown.
         """
         pass

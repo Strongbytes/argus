@@ -17,7 +17,7 @@ def _load_all(traces_dir):
     }
 
 
-class TestWriteToDisk:
+class TestEmit:
     def test_one_file_per_trace_grouping_spans(self, traces_dir):
         exporter = FileSpanExporter(traces_dir, script_name="myscript")
         exporter.export(
@@ -28,7 +28,7 @@ class TestWriteToDisk:
             ]
         )
 
-        exporter.write_to_disk(failed=False)
+        exporter.emit(failed=False)
 
         traces = _load_all(traces_dir)
         assert len(traces) == 2
@@ -43,7 +43,7 @@ class TestWriteToDisk:
         exporter = FileSpanExporter(traces_dir, script_name="myscript")
         exporter.export([make_span(trace_id=7, name="x")])
 
-        exporter.write_to_disk(failed=True)
+        exporter.emit(failed=True)
 
         (path,) = list(traces_dir.iterdir())
         assert path.name.endswith(".error.json")
@@ -52,7 +52,7 @@ class TestWriteToDisk:
         exporter = FileSpanExporter(traces_dir, script_name="s")
         exporter.export([make_span(trace_id=1, output='{"k": 1}')])
 
-        exporter.write_to_disk()
+        exporter.emit()
 
         (spans,) = _load_all(traces_dir).values()
         assert spans[0]["output"] == {"k": 1}
@@ -76,7 +76,7 @@ class TestWriteToDisk:
             ]
         )
 
-        exporter.write_to_disk()
+        exporter.emit()
 
         (spans,) = _load_all(traces_dir).values()
         assert [span["name"] for span in spans] == ["root", "leaf"]
@@ -90,7 +90,7 @@ class TestWriteToDisk:
             ]
         )
 
-        exporter.write_to_disk()
+        exporter.emit()
 
         (spans,) = _load_all(traces_dir).values()
         assert [span["name"] for span in spans] == ["first", "second"]

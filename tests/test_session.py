@@ -104,9 +104,7 @@ class TestSpanLimits:
             "proj", exporters=[recording_exporter], load_dotenv=False
         )
 
-        assert (
-            session.provider._span_limits.max_span_attributes == self.DEFAULT
-        )
+        assert session.provider._span_limits.max_span_attributes == self.DEFAULT
 
     def test_provider_retains_attributes_past_otel_default(
         self, monkeypatch, use_instrumentors, recording_exporter
@@ -183,7 +181,7 @@ class TestFlush:
 
         session.flush()
 
-        assert recording_exporter.write_calls == [True]
+        assert recording_exporter.emit_calls == [True]
 
     def test_explicit_failed_overrides_flag(
         self, use_instrumentors, recording_exporter
@@ -195,7 +193,7 @@ class TestFlush:
 
         session.flush(failed=True)
 
-        assert recording_exporter.write_calls == [True]
+        assert recording_exporter.emit_calls == [True]
 
     def test_is_idempotent(self, use_instrumentors, recording_exporter):
         use_instrumentors()
@@ -206,7 +204,7 @@ class TestFlush:
         session.flush()
         session.flush()
 
-        assert recording_exporter.write_calls == [False]
+        assert recording_exporter.emit_calls == [False]
 
 
 class TestContextManager:
@@ -219,7 +217,7 @@ class TestContextManager:
         ):
             pass
 
-        assert recording_exporter.write_calls == [False]
+        assert recording_exporter.emit_calls == [False]
 
     def test_flags_failure_and_propagates_exception(
         self, use_instrumentors, recording_exporter
@@ -231,7 +229,7 @@ class TestContextManager:
             ):
                 raise ValueError("boom")
 
-        assert recording_exporter.write_calls == [True]
+        assert recording_exporter.emit_calls == [True]
 
 
 class TestReset:
@@ -286,7 +284,7 @@ class TestFlushOnExit:
 
         session_module._flush_on_exit()
 
-        assert recording_exporter.write_calls == [False]
+        assert recording_exporter.emit_calls == [False]
 
     def test_noop_without_active_session(self):
         assert session_module._session is None

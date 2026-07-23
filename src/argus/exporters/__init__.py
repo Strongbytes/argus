@@ -1,11 +1,22 @@
 """Span exporters: the sinks that decide where captured traces end up.
 
-Currently Argus ships one, :class:`~argus.exporters.file.FileSpanExporter`,
-which writes readable JSON to disk. Re-exported here so callers can reach it as
-``argus.exporters.FileSpanExporter`` regardless of the module layout, and so
-future exporters (e.g. a remote OTLP sink) have an obvious home.
+Argus ships two, and they share one lifecycle -- buffer spans in memory, then
+emit once on exit. :class:`~argus.exporters.file.FileSpanExporter` writes
+readable JSON to disk; :class:`~argus.exporters.otlp.OTLPSpanExporter` POSTs the
+buffered run to a remote backend over OTLP/HTTP. Both are re-exported here (with
+the :func:`~argus.exporters.otlp.make_otlp_exporter` convenience factory) so
+callers can reach them as ``argus.exporters.<name>`` regardless of the module
+layout.
 """
 
 from .file import FileSpanExporter
+from .otlp import (
+    OTLPSpanExporter,
+    make_otlp_exporter,
+)
 
-__all__ = ["FileSpanExporter"]
+__all__ = [
+    "FileSpanExporter",
+    "OTLPSpanExporter",
+    "make_otlp_exporter",
+]

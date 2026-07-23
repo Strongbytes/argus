@@ -38,6 +38,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor, SpanExporter
 
 from .detection import resolve_instrumentors
 from .exporters.file import FileSpanExporter
+from .exporters.otlp import make_otlp_exporter
 from .paths import default_traces_dir
 
 # OpenTelemetry caps span attributes at 128 by default. OpenInference flattens
@@ -202,19 +203,21 @@ class Session:
         self._flushed = False
 
     def flush(self, *, failed: Optional[bool] = None) -> None:
-        """Write buffered traces to their exporters exactly once.
+        """Emit every buffered exporter's traces exactly once.
 
-        ``failed`` overrides the auto-detected outcome; when omitted we use the
-        process-wide flag set by our excepthook.
+        Argus's exporters buffer spans in memory and defer their real output
+        (a JSON file, an OTLP POST) to an ``emit(failed=...)`` hook that this
+        method drives on exit. ``failed`` overrides the auto-detected outcome;
+        when omitted we use the process-wide flag set by our excepthook.
         """
         if self._flushed:
             return
         self._flushed = True
         is_failed = _run_failed if failed is None else failed
         for exporter in self.exporters:
-            write_to_disk = getattr(exporter, "write_to_disk", None)
-            if callable(write_to_disk):
-                write_to_disk(failed=is_failed)
+            emit = getattr(exporter, "emit", None)
+            if callable(emit):
+                emit(failed=is_failed)
 
     def __enter__(self) -> "Session":
         """Enter the context manager, returning the session itself."""
@@ -237,6 +240,7 @@ def init(
     instrument: Union[str, Sequence[str], None] = None,
     output_dir: Union[str, Path, None] = None,
     exporters: Optional[Sequence[SpanExporter]] = None,
+    otlp: Union[bool, str, None] = None,
     load_dotenv: bool = True,
 ) -> Session:
     """Configure tracing and turn on the right instrumentor(s).
@@ -255,6 +259,16 @@ def init(
             ``<cwd>/traces``.
         exporters: Custom span exporters. Defaults to a single
             :class:`FileSpanExporter` writing readable JSON.
+        otlp: Enable remote OTLP/HTTP export *alongside* the other exporters.
+            The spans are buffered and POSTed once on exit (same lifecycle as
+            the on-disk exporter), not streamed mid-run. ``True`` reads the
+            endpoint from the ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` env var,
+            raising :class:`ValueError` if it is unset -- Argus ships no default
+            endpoint; a string sets the full endpoint URL explicitly. Falsy
+            values (the default) leave OTLP off. For headers/timeout or full
+            control, build the exporter with
+            :func:`~argus.exporters.otlp.make_otlp_exporter` and pass it in
+            ``exporters`` instead.
         load_dotenv: Load environment variables from a ``.env`` file found from
             the working directory.
 
@@ -299,6 +313,18 @@ def init(
         exporters = [
             FileSpanExporter(base_dir, script_name=_detect_script_name())
         ]
+    else:
+        exporters = list(exporters)
+    # ``otlp`` layers a remote sink on top of whatever the exporter list already
+    # holds, so the on-disk JSON and the remote backend can run side by side. A
+    # string is the endpoint; True defers to the OTEL_EXPORTER_OTLP_TRACES_
+    # ENDPOINT env var (and errors if that is unset).
+    if otlp:
+        endpoint = otlp if isinstance(otlp, str) else None
+        exporters.append(make_otlp_exporter(endpoint))
+    # Every Argus exporter buffers spans and emits on exit, so SimpleSpanProcessor
+    # (synchronous, no background queue that could drop under load) suits them
+    # all; the actual send/write is deferred to each exporter's ``emit`` hook.
     for exporter in exporters:
         provider.add_span_processor(SimpleSpanProcessor(exporter))
 

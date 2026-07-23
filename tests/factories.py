@@ -9,7 +9,7 @@ relies on:
   ``BaseInstrumentor`` API that :func:`argus.init` and :func:`argus._reset`
   call (``instrument`` / ``uninstrument``), with call recording.
 * :class:`RecordingExporter` -- a real :class:`SpanExporter` that records the
-  spans it is handed and the ``write_to_disk`` flushes Argus drives on exit.
+  spans it is handed and the ``emit`` flushes Argus drives on exit.
 * :class:`FakeSpan` -- the minimal ``ReadableSpan`` shape
   :class:`~argus.exporters.file.FileSpanExporter` consumes
   (``context.trace_id`` + ``to_json``).
@@ -65,24 +65,24 @@ class RaisingUninstrumentor(FakeInstrumentor):
 
 
 class RecordingExporter(SpanExporter):
-    """A real ``SpanExporter`` that records exports and disk flushes.
+    """A real ``SpanExporter`` that records exports and emit flushes.
 
-    Implements the ``write_to_disk(failed=...)`` hook that
+    Implements the ``emit(failed=...)`` hook that
     :meth:`argus.Session.flush` looks for, so tests can assert the failure flag
-    propagates without writing any files.
+    propagates without writing any files or hitting the network.
     """
 
     def __init__(self) -> None:
         self.exported_spans: List[Any] = []
-        self.write_calls: List[bool] = []
+        self.emit_calls: List[bool] = []
         self.shutdown_count = 0
 
     def export(self, spans: Sequence[Any]) -> SpanExportResult:
         self.exported_spans.extend(spans)
         return SpanExportResult.SUCCESS
 
-    def write_to_disk(self, failed: bool = False) -> None:
-        self.write_calls.append(failed)
+    def emit(self, failed: bool = False) -> None:
+        self.emit_calls.append(failed)
 
     def force_flush(self, timeout_millis: int = 30_000) -> bool:
         return True

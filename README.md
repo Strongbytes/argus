@@ -32,15 +32,14 @@ The package is named `argus-trace` and imported as `argus`. Install it with
 pip install "argus-trace[openai-agents]"   # OpenAI Agents SDK
 pip install "argus-trace[claude]"          # Claude Agent SDK
 pip install "argus-trace[agno]"            # Agno
-pip install "argus-trace[otlp]"            # deps for a remote OTLP/HTTP exporter
+pip install "argus-trace[otlp]"            # remote OTLP/HTTP export
 ```
 
 The bare `pip install argus-trace` pulls only the thin core (OpenTelemetry +
 `python-dotenv`); instrumentors are optional so Argus stays lightweight.
 
-The `[otlp]` extra installs the OpenTelemetry OTLP exporter package so you can
-construct your own exporter and pass it via `exporters=` (see the roadmap for
-planned built-in support).
+The `[otlp]` extra installs the OpenTelemetry OTLP/HTTP exporter package that
+backs the built-in remote export (see [Remote export over OTLP](#remote-export-over-otlp)).
 
 ## Local development
 
@@ -84,6 +83,7 @@ pytest --cov --cov-report=html     # also write an htmlcov/ report to browse
 | `instrument`  | `None`               | `None`/`"curated"` = curated auto-detection; `"all"` = entry-point discovery; a key or list of keys (`"openai_agents"`, `["agno"]`). |
 | `output_dir`  | `<cwd>/traces`       | Directory traces are written to.                                                                                                     |
 | `exporters`   | `[FileSpanExporter]` | Swap in your own OpenTelemetry exporters (e.g. OTLP).                                                                                |
+| `otlp`        | `None`               | Enable remote OTLP/HTTP export alongside the others. `True` = default endpoint; a string sets the endpoint URL. See below.           |
 | `load_dotenv` | `True`               | Load a `.env` found from the working directory.                                                                                      |
 
 `init` returns a `Session` that flushes automatically via `atexit`. It can also
@@ -93,6 +93,66 @@ be used as a context manager for deterministic, scoped flushing:
 with argus.init("my_project_name"):
     run_my_agent()
 ```
+
+## Remote export over OTLP
+
+Besides the on-disk JSON, Argus can send spans to a backend over standard
+OTLP/HTTP (protobuf POSTs). It runs _alongside_ the file exporter -- you keep the
+local trace files and get remote ingest too. Install the extra and flip `otlp`
+on:
+
+```bash
+pip install "argus-trace[otlp]"
+```
+
+```python
+import argus
+
+# otlp=True reads the endpoint from OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+# (and raises if it is unset -- there is no default endpoint):
+argus.init("my_project_name", otlp=True)
+
+# Or point it at your own ingest route explicitly:
+argus.init("my_project_name", otlp="http://localhost:9000/api/v1/trace/ingest")
+```
+
+Argus ships **no default endpoint**: it's a library anyone can install, so
+rather than guess a target (and risk quietly shipping traces to the wrong
+backend) it requires one to be set. The endpoint is used verbatim as the POST
+URL (no `/v1/traces` path is appended for you). It can come from the `otlp=`
+argument or, when you pass `otlp=True`, from the standard
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` environment variable; auth headers /
+timeouts come from the usual `OTEL_EXPORTER_OTLP_TRACES_HEADERS` and
+`OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` vars. If neither the argument nor the env
+var supplies an endpoint, `init` raises `ValueError`.
+
+The OTLP exporter follows the same lifecycle as the file exporter: it **buffers
+spans in memory and POSTs the whole run once, on exit** (not streamed mid-run),
+so the backend is hit a single time per run instead of absorbing a trickle of
+batches. The trade-off is identical to the file sink's -- a hard kill before exit
+loses the trace, since nothing was sent yet -- and a run's failure is carried on
+each span's own status rather than in a filename.
+
+For full control (custom headers, timeout, compression, a shared HTTP session),
+build the exporter yourself and pass it via `exporters=`:
+
+```python
+from argus.exporters import make_otlp_exporter
+
+argus.init(
+    "my_project_name",
+    exporters=[
+        make_otlp_exporter(
+            "http://localhost:9000/api/v1/trace/ingest",
+            headers={"authorization": "Bearer …"},
+            timeout=10,
+        ),
+    ],
+)
+```
+
+Note that passing `exporters=` replaces the default file exporter; combine
+`make_otlp_exporter(...)` with a `FileSpanExporter` in the list if you want both.
 
 ## Excluding code from tracing (`argus.blindspot`)
 
@@ -142,6 +202,4 @@ the `openinference_instrumentor` entry-point group.
 
 ## Roadmap
 
-- Remote export over standard OTLP/HTTP (streamed via `BatchSpanProcessor`),
-  usable alongside the on-disk JSON exporter.
 - Span scrubbing/redaction hook before export.
