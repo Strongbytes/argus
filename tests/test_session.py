@@ -37,6 +37,26 @@ class TestInit:
         assert session.instrumentors == [inst]
         assert session.instruments == ["FakeInstrumentor"]
 
+    def test_provider_does_not_register_its_own_atexit_shutdown(
+        self, use_instrumentors, recording_exporter, traces_dir
+    ):
+        # Regression guard for an atexit ordering collision. A TracerProvider
+        # registers its own atexit shutdown by default, and atexit runs LIFO;
+        # since Argus's _flush_on_exit is registered at import (before any
+        # provider), that shutdown would run first on exit and tear down the
+        # OTLP transport before Argus's flush emits -- so emit() would hit an
+        # already-dead transport and the backend would never be contacted.
+        # Argus owns the lifecycle, so the provider must register no handler.
+        use_instrumentors()
+        session = argus.init(
+            "proj",
+            exporters=[recording_exporter],
+            output_dir=traces_dir,
+            load_dotenv=False,
+        )
+
+        assert session.provider._atexit_handler is None
+
     def test_stamps_resource_attributes(
         self, use_instrumentors, recording_exporter
     ):

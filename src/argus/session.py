@@ -305,8 +305,21 @@ def init(
             "argus.version": argus_version,
         }
     )
+    # shutdown_on_exit=False is load-bearing, not a tidiness choice. A
+    # TracerProvider otherwise registers its own atexit handler in its
+    # constructor, and atexit runs handlers LIFO. Argus's _flush_on_exit is
+    # registered at *import* time -- before any provider exists -- so the
+    # provider's shutdown, registered here at init time, would run *first* on
+    # exit. That shutdown cascades into each exporter's shutdown(), tearing down
+    # the OTLP transport's HTTP session, so Argus's later flush would then call
+    # emit() on an already-dead transport (OTel logs "Exporter already shutdown,
+    # ignoring batch" and returns FAILURE -- the backend is never even
+    # contacted). Argus drives the whole buffer-now/emit-once lifecycle itself
+    # via _flush_on_exit, so we opt out of the provider's competing handler.
     provider = TracerProvider(
-        resource=resource, span_limits=_resolve_span_limits()
+        resource=resource,
+        span_limits=_resolve_span_limits(),
+        shutdown_on_exit=False,
     )
 
     if exporters is None:

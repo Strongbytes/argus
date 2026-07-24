@@ -48,7 +48,7 @@ requirements pull in an editable install of the package plus the formatting
 tools:
 
 ```bash
-pip install -r requirements-dev.txt   # editable install (-e .) + black + isort + pytest + pytest-cov
+pip install -r requirements-dev.txt   # editable install (-e .) + black + isort + commitizen + pytest + pytest-cov
 ```
 
 Install the relevant `[…]` extra from above as well if you want to exercise a
@@ -64,6 +64,14 @@ pytest
 
 The tests use lightweight fakes for the instrumentors and exporters (see
 `tests/factories.py`), so no agent-framework extras are required to run them.
+
+To narrow a run down to a single file, test, or keyword while iterating:
+
+```bash
+pytest tests/test_session.py                 # one file
+pytest tests/test_session.py::TestInit       # one class
+pytest -k otlp                               # any test matching a keyword
+```
 
 Coverage is opt-in. Pass `--cov` to get a terminal report (the measured
 package and the `term-missing` output are preconfigured in `pyproject.toml`, so
@@ -83,7 +91,7 @@ pytest --cov --cov-report=html     # also write an htmlcov/ report to browse
 | `instrument`  | `None`               | `None`/`"curated"` = curated auto-detection; `"all"` = entry-point discovery; a key or list of keys (`"openai_agents"`, `["agno"]`). |
 | `output_dir`  | `<cwd>/traces`       | Directory traces are written to.                                                                                                     |
 | `exporters`   | `[FileSpanExporter]` | Swap in your own OpenTelemetry exporters (e.g. OTLP).                                                                                |
-| `otlp`        | `None`               | Enable remote OTLP/HTTP export alongside the others. `True` = default endpoint; a string sets the endpoint URL. See below.           |
+| `otlp`        | `None`               | Enable remote OTLP/HTTP export alongside the others. `True` reads the endpoint from `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` (raises if unset -- no default); a string sets the endpoint URL. See below. |
 | `load_dotenv` | `True`               | Load a `.env` found from the working directory.                                                                                      |
 
 `init` returns a `Session` that flushes automatically via `atexit`. It can also
