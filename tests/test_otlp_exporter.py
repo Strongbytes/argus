@@ -29,15 +29,30 @@ _OTLP_MODULE = "opentelemetry.exporter.otlp.proto.http.trace_exporter"
 
 
 class _RecordingTransport(SpanExporter):
-    """Stand-in for the real OTLP transport: records what it's asked to send."""
+    """Stand-in for the real OTLP transport: records what it's asked to send.
 
-    def __init__(self) -> None:
+    Delivery behavior is configurable so failure paths can be exercised without
+    a network: ``result`` is the :class:`SpanExportResult` each ``export``
+    returns, and setting ``raises`` makes ``export`` raise that exception
+    instead (standing in for a connection error the real transport might let
+    escape rather than reporting via return value).
+    """
+
+    def __init__(
+        self,
+        result: SpanExportResult = SpanExportResult.SUCCESS,
+        raises: Exception | None = None,
+    ) -> None:
         self.exported: List[Any] = []
         self.shutdown_count = 0
+        self.result = result
+        self.raises = raises
 
     def export(self, spans) -> SpanExportResult:
         self.exported.append(list(spans))
-        return SpanExportResult.SUCCESS
+        if self.raises is not None:
+            raise self.raises
+        return self.result
 
     def shutdown(self) -> None:
         self.shutdown_count += 1
@@ -158,6 +173,67 @@ class TestBufferAndEmit:
         exporter.shutdown()
 
         assert fake_transport.shutdown_count == 1
+
+
+class TestDeliveryFailureIsReportedNotFatal:
+    """A backend failure must warn (never crash) and keep the spans buffered.
+
+    Argus is a side-channel, so a down/rejecting backend can't be allowed to
+    crash the run -- but a silent drop is just as bad with an emit-once model,
+    so the failure surfaces as a ``RuntimeWarning`` and the buffer is emptied
+    only on a confirmed success.
+    """
+
+    def _exporter_with(self, monkeypatch, transport):
+        monkeypatch.setattr(
+            "argus.exporters.otlp._build_transport",
+            lambda endpoint, headers, timeout: transport,
+        )
+        return OTLPSpanExporter("http://localhost:9000/ingest")
+
+    def test_rejected_batch_warns_and_keeps_buffer(self, monkeypatch):
+        transport = _RecordingTransport(result=SpanExportResult.FAILURE)
+        exporter = self._exporter_with(monkeypatch, transport)
+        exporter.export(["span-a"])
+
+        with pytest.warns(RuntimeWarning, match="rejected"):
+            exporter.emit()
+
+        # Failure attempted the send but left the spans intact: a later
+        # successful emit can still deliver them.
+        assert transport.exported == [["span-a"]]
+        transport.result = SpanExportResult.SUCCESS
+        exporter.emit()
+        assert transport.exported == [["span-a"], ["span-a"]]
+
+    def test_transport_raise_is_caught_warns_and_keeps_buffer(
+        self, monkeypatch
+    ):
+        transport = _RecordingTransport(raises=ConnectionError("refused"))
+        exporter = self._exporter_with(monkeypatch, transport)
+        exporter.export(["span-a"])
+
+        # The raise must not propagate (it would crash atexit or, via the
+        # context manager, mask the user's own exception).
+        with pytest.warns(RuntimeWarning, match="ConnectionError"):
+            exporter.emit()
+
+        transport.raises = None
+        transport.result = SpanExportResult.SUCCESS
+        exporter.emit()
+        # The spans survived the failed attempt and were delivered on retry.
+        assert transport.exported[-1] == ["span-a"]
+
+    def test_success_clears_buffer(self, monkeypatch):
+        transport = _RecordingTransport(result=SpanExportResult.SUCCESS)
+        exporter = self._exporter_with(monkeypatch, transport)
+        exporter.export(["span-a"])
+
+        exporter.emit()
+        exporter.emit()
+
+        # Cleared on success, so the second emit is a no-op (no resend).
+        assert transport.exported == [["span-a"]]
 
 
 class TestInitOtlpIntegration:

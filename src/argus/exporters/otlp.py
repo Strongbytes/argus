@@ -38,6 +38,7 @@ and early at :func:`argus.init` time rather than silently at exit.
 from __future__ import annotations
 
 import os
+import warnings
 from typing import List, Mapping, Optional, Sequence
 
 from opentelemetry.sdk.trace import ReadableSpan
@@ -171,7 +172,19 @@ class OTLPSpanExporter(SpanExporter):
 
         Argus calls this exactly once, on exit. All buffered spans (across every
         trace in the run) go out in one OTLP request; an empty buffer sends
-        nothing. The buffer is cleared so a stray second call is a no-op.
+        nothing.
+
+        Delivery failures are reported, never fatal. Argus is a side-channel: a
+        backend that is down, slow, or rejects the batch must not crash the run
+        (nor, via the context-manager path, mask the user's own exception). But
+        a silent drop is just as bad -- with an emit-once-on-exit model there is
+        no later batch to reveal the gap -- so a failure is surfaced as a
+        :class:`RuntimeWarning` (which ``python -W error`` can promote to an
+        exception for callers who want strictness). Note the transport reports a
+        rejected batch by *return value* (it retries retryable statuses, then
+        gives up) rather than by raising, so both the returned
+        :class:`SpanExportResult` and a rare raise are handled. The buffer is
+        emptied only on a confirmed success, leaving the spans intact otherwise.
 
         ``failed`` is accepted for parity with the buffered-exporter contract
         (the same hook the file sink uses to tag its filename). The remote
@@ -180,8 +193,27 @@ class OTLPSpanExporter(SpanExporter):
         """
         if not self._spans:
             return
-        spans, self._spans = self._spans, []
-        self._transport.export(spans)
+        span_count = len(self._spans)
+        try:
+            result = self._transport.export(self._spans)
+        except Exception as exc:
+            warnings.warn(
+                f"Argus: failed to export {span_count} span(s) to "
+                f"{self._endpoint!r}; they were not delivered "
+                f"({type(exc).__name__}: {exc}).",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return
+        if result == SpanExportResult.SUCCESS:
+            self._spans = []
+            return
+        warnings.warn(
+            f"Argus: the backend rejected the export of {span_count} span(s) "
+            f"to {self._endpoint!r}; they were not delivered.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     def force_flush(self, timeout_millis: int = 30_000) -> bool:
         """Satisfy the ``SpanExporter`` interface; a no-op here.
