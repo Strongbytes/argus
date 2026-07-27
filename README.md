@@ -5,8 +5,9 @@ and [OpenTelemetry](https://opentelemetry.io/) that captures LLM agent traces.
 
 Argus is the all-seeing companion to Aegis: it watches what your agents do and
 records it. One call detects the agent framework in use, turns on the matching
-OpenInference instrumentor(s), and persists each run's spans to disk as readable
-JSON.
+OpenInference instrumentor(s), and persists each run's spans to disk as both
+canonical OTLP/JSON (replayable to any OTLP backend) and a human-readable
+rendering.
 
 ```python
 import argus
@@ -19,9 +20,19 @@ argus.init("my_project_name")      # "my_project_name" is the project name; the
 # ... run your agent ...
 ```
 
-On process exit, spans are written under `traces/` as one indented JSON file per
-trace, named `YYYY-MM-DD_HH-MM-SS_<script>.json`. A run that ends in an unhandled
-exception is still captured, tagged with a `.error.json` suffix.
+On process exit, each trace is written under `traces/` as **two** files sharing
+a base name of `YYYY-MM-DD_HH-MM-SS_<script>`, differing only by a format marker:
+
+- `..._<script>.otlp.json` -- canonical OTLP/JSON, the exact shape the wire
+  protocol uses, so it can be POSTed straight back to any OTLP backend.
+- `..._<script>.readable.json` -- a human-readable rendering: a plain list of
+  spans with embedded JSON payloads (prompts, completions, tool arguments)
+  unescaped into real structure.
+
+The date-first name keeps a directory listing sorted chronologically. A run that
+ends in an unhandled exception is still captured, tagged with an `.error` marker
+before the format suffix (`..._<script>.error.otlp.json` and
+`..._<script>.error.readable.json`).
 
 ## Installation
 

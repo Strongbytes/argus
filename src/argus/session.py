@@ -258,7 +258,8 @@ def init(
         output_dir: Directory traces are written to. Defaults to
             ``<cwd>/traces``.
         exporters: Custom span exporters. Defaults to a single
-            :class:`FileSpanExporter` writing readable JSON.
+            :class:`FileSpanExporter` writing each trace to disk as both
+            canonical OTLP/JSON and a human-readable rendering.
         otlp: Enable remote OTLP/HTTP export *alongside* the other exporters.
             The spans are buffered and POSTed once on exit (same lifecycle as
             the on-disk exporter), not streamed mid-run. ``True`` reads the

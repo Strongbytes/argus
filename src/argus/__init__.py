@@ -3,7 +3,7 @@
 Argus is the all-seeing companion to Aegis: it watches what your agents do and
 records it. A single :func:`init` call detects the agent framework in use,
 turns on the matching OpenInference instrumentor(s), and persists each run's
-spans to disk as readable JSON.
+spans to disk as both canonical OTLP/JSON and a human-readable rendering.
 
 Typical usage::
 
