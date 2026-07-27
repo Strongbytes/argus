@@ -6,6 +6,11 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "opentelemetry-sdk>=1.30",
+    # The default on-disk sink writes canonical OTLP/JSON, so it needs the OTLP
+    # protobuf span encoder (and, transitively, protobuf). This is the common
+    # encoding layer only -- not a network transport -- so the core stays light;
+    # the ``otlp`` extra below adds the actual OTLP/HTTP exporter on top.
+    "opentelemetry-exporter-otlp-proto-common>=1.30",
     "python-dotenv>=1.0",
 ]
 

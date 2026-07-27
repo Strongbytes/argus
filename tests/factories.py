@@ -10,9 +10,11 @@ relies on:
   call (``instrument`` / ``uninstrument``), with call recording.
 * :class:`RecordingExporter` -- a real :class:`SpanExporter` that records the
   spans it is handed and the ``emit`` flushes Argus drives on exit.
-* :class:`FakeSpan` -- the minimal ``ReadableSpan`` shape
-  :class:`~argus.exporters.file.FileSpanExporter` consumes
-  (``context.trace_id`` + ``to_json``).
+* :func:`make_span` -- a real :class:`~opentelemetry.sdk.trace.ReadableSpan`
+  with a caller-chosen trace id, start time, and attributes. The file exporter
+  now encodes buffered spans with the OTLP span encoder, which needs genuine
+  ``ReadableSpan`` objects (context, resource, scope, timings), so a hand-rolled
+  stand-in no longer suffices.
 * :func:`patch_resolve_instrumentors` -- swaps the framework-detection seam so
   ``init`` turns on the fakes we hand it instead of probing the environment.
 """
@@ -20,11 +22,13 @@ relies on:
 from __future__ import annotations
 
 import itertools
-import json
-from dataclasses import dataclass, field
 from typing import Any, List, Optional, Sequence
 
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
+from opentelemetry.sdk.util.instrumentation import InstrumentationScope
+from opentelemetry.trace import SpanContext, SpanKind, TraceFlags
 
 
 class FakeInstrumentor:
@@ -91,38 +95,48 @@ class RecordingExporter(SpanExporter):
         self.shutdown_count += 1
 
 
-@dataclass(frozen=True)
-class _FakeSpanContext:
-    trace_id: int
-
-
 _TRACE_IDS = itertools.count(1)
+# Every span needs a unique, non-zero span id for the OTLP encoder; a shared
+# counter keeps them distinct across a whole test run.
+_SPAN_IDS = itertools.count(1)
+
+# One resource/scope shared by all fabricated spans: the file exporter groups by
+# trace id, not by these, and reusing them keeps the encoded output tidy.
+_TEST_RESOURCE = Resource.create({"service.name": "test"})
+_TEST_SCOPE = InstrumentationScope("argus-tests")
 
 
-@dataclass
-class FakeSpan:
-    """Minimal ``ReadableSpan`` stand-in for the file exporter.
+def make_span(
+    trace_id: Optional[int] = None,
+    *,
+    name: str = "span",
+    start_time: Optional[int] = None,
+    **attributes: Any,
+) -> ReadableSpan:
+    """Return a real :class:`ReadableSpan` the OTLP encoder can serialize.
 
-    The exporter only reads ``context.trace_id`` and calls ``to_json`` before
-    re-parsing, so we expose just those.
+    Auto-assigns a trace id (and always a fresh span id) when omitted. Extra
+    keyword arguments become span attributes, so ``make_span(output="x")``
+    stamps ``{"output": "x"}`` onto the span. ``start_time`` is an epoch
+    nanosecond stamp used to exercise generation-order sorting; when omitted the
+    span carries no start time (matching the "field absent" path).
     """
-
-    trace_id: int
-    payload: dict = field(default_factory=dict)
-
-    @property
-    def context(self) -> _FakeSpanContext:
-        return _FakeSpanContext(self.trace_id)
-
-    def to_json(self, indent: Optional[int] = None) -> str:
-        return json.dumps(self.payload, indent=indent)
-
-
-def make_span(trace_id: Optional[int] = None, **payload: Any) -> FakeSpan:
-    """Return a :class:`FakeSpan`, auto-assigning a trace id when omitted."""
-    return FakeSpan(
-        trace_id=next(_TRACE_IDS) if trace_id is None else trace_id,
-        payload=payload,
+    trace_id = next(_TRACE_IDS) if trace_id is None else trace_id
+    context = SpanContext(
+        trace_id=trace_id,
+        span_id=next(_SPAN_IDS),
+        is_remote=False,
+        trace_flags=TraceFlags(TraceFlags.SAMPLED),
+    )
+    return ReadableSpan(
+        name=name,
+        context=context,
+        resource=_TEST_RESOURCE,
+        instrumentation_scope=_TEST_SCOPE,
+        attributes=dict(attributes),
+        kind=SpanKind.INTERNAL,
+        start_time=start_time,
+        end_time=start_time,
     )
 
 
