@@ -1,3 +1,9 @@
+## v0.6.0 (2026-07-27)
+
+### Feat
+
+- add back a human readable version for fileexporter alongside otlp
+
 ## v0.5.0 (2026-07-27)
 
 ### Feat
