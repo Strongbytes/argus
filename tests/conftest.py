@@ -32,6 +32,20 @@ def reset_argus_state():
     session_module._reset()
 
 
+@pytest.fixture(autouse=True)
+def no_dotenv(monkeypatch):
+    """Stop ``init`` from reading the developer's real ``.env``.
+
+    ``init`` loads a ``.env`` found from the working directory, which in a
+    checkout is whatever the person running the suite happens to keep there.
+    Left alone it would leak into tests -- most sharply into the ones asserting
+    that ``init`` raises when no API key or endpoint is configured, which a
+    stray local value would quietly satisfy. Tests that care about environment
+    variables set them explicitly with ``monkeypatch``.
+    """
+    monkeypatch.setattr(session_module, "_load_dotenv", lambda: None)
+
+
 @pytest.fixture
 def traces_dir(tmp_path):
     """A temporary directory to write traces into."""

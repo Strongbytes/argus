@@ -33,6 +33,13 @@ buffered span in one ``export`` call at the end. That transport lives in the
 optional ``argus-trace[otlp]`` extra, so it is imported when an exporter is
 constructed (i.e. when you actually ask for OTLP) -- a missing extra fails loudly
 and early at :func:`argus.init` time rather than silently at exit.
+
+Ingest endpoints are authenticated, so an API key is part of the configuration
+here alongside the endpoint (see :func:`_resolve_auth_headers`). It is resolved
+and validated when the exporter is *constructed*, not when spans are sent: with
+an emit-once-on-exit model a credential problem discovered at send time would
+surface as a rejected batch during interpreter shutdown, after the run's whole
+trace had already been buffered and with nothing left to retry.
 """
 
 from __future__ import annotations
@@ -49,6 +56,14 @@ from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 # deliberately, the *only* fallback: Argus ships no built-in default endpoint
 # (see :func:`_resolve_endpoint`).
 _OTLP_TRACES_ENDPOINT_ENV_VAR = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"
+
+# Where the API key comes from when it isn't passed explicitly. Named for Aegis
+# rather than Argus because the credential is issued and validated by the Aegis
+# backend that receives the traces; Argus is only the client presenting it.
+_API_KEY_ENV_VAR = "AEGIS_API_KEY"
+# The header the key travels in. Aegis authenticates ingest by reading the
+# standard ``Authorization`` header and requiring the ``Bearer`` scheme.
+_AUTH_HEADER = "Authorization"
 
 
 def _resolve_endpoint(endpoint: Optional[str]) -> str:
@@ -75,6 +90,62 @@ def _resolve_endpoint(endpoint: Optional[str]) -> str:
             f"the {_OTLP_TRACES_ENDPOINT_ENV_VAR} environment variable."
         )
     return resolved
+
+
+def _resolve_auth_headers(
+    api_key: Optional[str],
+    headers: Optional[Mapping[str, str]],
+) -> Mapping[str, str]:
+    """Turn an API key into the ``Authorization`` header the backend expects.
+
+    Precedence mirrors :func:`_resolve_endpoint` and the major LLM SDKs: an
+    explicit ``api_key`` argument wins, then the ``AEGIS_API_KEY`` environment
+    variable. The env fallback is what keeps single-line initialization possible
+    -- and keeps callers from pasting a live secret into committed source just to
+    satisfy a required argument.
+
+    A key is mandatory: remote export exists to reach Aegis, whose ingest route
+    is authenticated, so there is no unauthenticated configuration worth
+    supporting. Any ``headers`` given are merged around the resolved
+    ``Authorization: Bearer <key>``, never in place of it.
+
+    Returns:
+        The headers to hand the transport -- the caller's, plus the bearer
+        credential.
+
+    Raises:
+        ValueError: If no key is resolvable; if the resolved key contains
+            whitespace (Aegis splits the header on whitespace, so such a key can
+            only ever come back as an opaque 401); or if ``headers`` already
+            carries an ``Authorization`` entry, which the key would silently
+            overwrite.
+    """
+    resolved = (
+        api_key if api_key is not None else os.environ.get(_API_KEY_ENV_VAR)
+    )
+    resolved = resolved.strip() if resolved is not None else None
+    if not resolved:
+        raise ValueError(
+            "No Aegis API key configured. Set the "
+            f"{_API_KEY_ENV_VAR} environment variable (a .env file in your "
+            "working directory is read for you) or pass one explicitly, e.g. "
+            "argus.init(..., otlp=True, api_key='sk_...')."
+        )
+    if any(char.isspace() for char in resolved):
+        raise ValueError(
+            "The Aegis API key contains whitespace, which cannot be sent in an "
+            f"{_AUTH_HEADER} header. Check the value passed to api_key or held "
+            f"in {_API_KEY_ENV_VAR}."
+        )
+    merged = dict(headers or {})
+    if any(name.lower() == _AUTH_HEADER.lower() for name in merged):
+        raise ValueError(
+            f"An {_AUTH_HEADER} header was passed in headers, but the api_key "
+            "is what authenticates the export and would overwrite it. Drop the "
+            "header and let the key set it."
+        )
+    merged[_AUTH_HEADER] = f"Bearer {resolved}"
+    return merged
 
 
 def _build_transport(
@@ -123,6 +194,7 @@ class OTLPSpanExporter(SpanExporter):
         self,
         endpoint: Optional[str] = None,
         *,
+        api_key: Optional[str] = None,
         headers: Optional[Mapping[str, str]] = None,
         timeout: Optional[int] = None,
     ) -> None:
@@ -134,25 +206,34 @@ class OTLPSpanExporter(SpanExporter):
                 unset too a :class:`ValueError` is raised, since Argus has no
                 default endpoint. Used verbatim -- no ``/v1/traces`` path is
                 appended -- so it must be the complete route.
-            headers: Extra HTTP headers sent with the export (e.g. an auth
-                token). May also be supplied via the standard
-                ``OTEL_EXPORTER_OTLP_TRACES_HEADERS`` env var, which the
-                transport reads on its own.
+            api_key: Key authenticating the export, sent as
+                ``Authorization: Bearer <key>``. Required; falls back to the
+                ``AEGIS_API_KEY`` env var. See :func:`_resolve_auth_headers`.
+            headers: Extra HTTP headers sent alongside the credential (e.g.
+                routing or tenant hints). Note that because Argus always passes
+                headers to the transport now, the transport's own
+                ``OTEL_EXPORTER_OTLP_TRACES_HEADERS`` env var is ignored.
             timeout: Per-export timeout in seconds; falls back to the
                 transport's own default (honoring
                 ``OTEL_EXPORTER_OTLP_TRACES_TIMEOUT``) when omitted.
 
         The transport (the real OpenTelemetry OTLP exporter) is built here, so
         a missing ``argus-trace[otlp]`` extra raises immediately rather than at
-        exit. ``_spans`` is the in-memory buffer filled by :meth:`export`.
+        exit. ``_spans`` is the in-memory buffer filled by :meth:`export`. The
+        key is held only inside the transport's headers, never on this exporter,
+        so it cannot leak through a warning or a repr.
 
         Raises:
             ValueError: If no ``endpoint`` is given and the
-                ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` env var is unset.
+                ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` env var is unset, or if
+                the API key is missing or unusable (see
+                :func:`_resolve_auth_headers`).
             ImportError: If the optional ``otlp`` extra is not installed.
         """
         self._endpoint = _resolve_endpoint(endpoint)
-        self._transport = _build_transport(self._endpoint, headers, timeout)
+        self._transport = _build_transport(
+            self._endpoint, _resolve_auth_headers(api_key, headers), timeout
+        )
         self._spans: List[ReadableSpan] = []
 
     def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
@@ -232,6 +313,7 @@ class OTLPSpanExporter(SpanExporter):
 def make_otlp_exporter(
     endpoint: Optional[str] = None,
     *,
+    api_key: Optional[str] = None,
     headers: Optional[Mapping[str, str]] = None,
     timeout: Optional[int] = None,
 ) -> OTLPSpanExporter:
@@ -243,8 +325,11 @@ def make_otlp_exporter(
 
     Raises:
         ValueError: If no ``endpoint`` is given and the
-            ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` env var is unset.
+            ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` env var is unset, or if the
+            API key is missing or unusable.
         ImportError: If the optional ``argus-trace[otlp]`` extra is not
             installed.
     """
-    return OTLPSpanExporter(endpoint, headers=headers, timeout=timeout)
+    return OTLPSpanExporter(
+        endpoint, api_key=api_key, headers=headers, timeout=timeout
+    )

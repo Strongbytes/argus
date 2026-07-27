@@ -18,6 +18,7 @@ import argus
 from argus import session as session_module
 from argus.exporters.otlp import (
     OTLPSpanExporter,
+    _resolve_auth_headers,
     _resolve_endpoint,
     make_otlp_exporter,
 )
@@ -26,6 +27,11 @@ from tests.factories import make_instrumentor
 
 # The module whose absence means the ``otlp`` extra isn't installed.
 _OTLP_MODULE = "opentelemetry.exporter.otlp.proto.http.trace_exporter"
+_API_KEY_ENV = "AEGIS_API_KEY"
+_AUTH_HEADER = "Authorization"
+# Shaped like a real Aegis key (``sk_`` + 32 chars) without being one; Argus
+# deliberately does not validate that shape, so nothing depends on it.
+_KEY = "sk_" + "a" * 32
 
 
 class _RecordingTransport(SpanExporter):
@@ -56,6 +62,19 @@ class _RecordingTransport(SpanExporter):
 
     def shutdown(self) -> None:
         self.shutdown_count += 1
+
+
+@pytest.fixture(autouse=True)
+def api_key_env(monkeypatch):
+    """Give every test in this module a resolvable API key by default.
+
+    Authentication is a construction-time requirement, but most tests here are
+    about buffering and delivery rather than credentials. Supplying the key via
+    the environment keeps those tests focused instead of threading a credential
+    through every call site; the tests that care about resolution set or clear
+    it themselves.
+    """
+    monkeypatch.setenv(_API_KEY_ENV, _KEY)
 
 
 @pytest.fixture
@@ -103,6 +122,85 @@ class TestResolveEndpoint:
 
         with pytest.raises(ValueError, match=self.ENV):
             _resolve_endpoint(None)
+
+
+class TestResolveAuthHeaders:
+    """The API key -> ``Authorization: Bearer`` mapping and its guard rails."""
+
+    def test_explicit_key_becomes_bearer_header(self, monkeypatch):
+        monkeypatch.delenv(_API_KEY_ENV, raising=False)
+
+        assert _resolve_auth_headers(_KEY, None) == {
+            "Authorization": f"Bearer {_KEY}"
+        }
+
+    def test_env_var_used_when_no_argument(self):
+        # The autouse fixture put the key in the environment.
+        assert _resolve_auth_headers(None, None) == {
+            "Authorization": f"Bearer {_KEY}"
+        }
+
+    def test_explicit_argument_wins_over_env_var(self, monkeypatch):
+        monkeypatch.setenv(_API_KEY_ENV, "sk_from_env")
+
+        headers = _resolve_auth_headers("sk_from_arg", None)
+
+        assert headers == {"Authorization": "Bearer sk_from_arg"}
+
+    def test_surrounding_whitespace_is_stripped(self, monkeypatch):
+        # A key pasted out of a shell or .env often carries a trailing newline.
+        headers = _resolve_auth_headers(f"  {_KEY}\n", None)
+
+        assert headers == {"Authorization": f"Bearer {_KEY}"}
+
+    def test_other_headers_are_preserved(self, monkeypatch):
+        headers = _resolve_auth_headers(_KEY, {"x-tenant": "acme"})
+
+        assert headers == {
+            "x-tenant": "acme",
+            "Authorization": f"Bearer {_KEY}",
+        }
+
+    def test_raises_when_no_key_anywhere(self, monkeypatch):
+        monkeypatch.delenv(_API_KEY_ENV, raising=False)
+
+        # Ingest is authenticated, so a missing key is a misconfiguration we
+        # surface now rather than as a 401 at interpreter shutdown, by which
+        # point the whole run's trace is unrecoverable.
+        with pytest.raises(ValueError, match=_API_KEY_ENV):
+            _resolve_auth_headers(None, None)
+
+    def test_blank_key_is_treated_as_missing(self, monkeypatch):
+        monkeypatch.delenv(_API_KEY_ENV, raising=False)
+
+        with pytest.raises(ValueError, match=_API_KEY_ENV):
+            _resolve_auth_headers("   ", None)
+
+    def test_key_containing_whitespace_raises(self, monkeypatch):
+        # Aegis splits the header on whitespace, so an interior space could only
+        # ever come back as an opaque 401. Name the real problem instead.
+        with pytest.raises(ValueError, match="whitespace"):
+            _resolve_auth_headers("sk_ab cd", None)
+
+    def test_headers_do_not_opt_out_of_the_key_requirement(self, monkeypatch):
+        monkeypatch.delenv(_API_KEY_ENV, raising=False)
+
+        # Remote export exists to reach Aegis, whose ingest is authenticated, so
+        # there is no header set that makes a key optional.
+        with pytest.raises(ValueError, match=_API_KEY_ENV):
+            _resolve_auth_headers(None, {"x-api-key": "other"})
+
+    def test_key_overwriting_a_given_authorization_header_raises(self):
+        # The key is going to win, so the header the caller wrote would vanish
+        # silently. Say so instead.
+        with pytest.raises(ValueError, match=_AUTH_HEADER):
+            _resolve_auth_headers(_KEY, {"Authorization": "Bearer other"})
+
+    def test_conflict_detection_ignores_header_name_case(self):
+        # HTTP header names are case-insensitive, so the clash is real however
+        # the caller spelled it.
+        with pytest.raises(ValueError, match=_AUTH_HEADER):
+            _resolve_auth_headers(_KEY, {"authorization": "Bearer other"})
 
 
 class TestMissingDependency:
@@ -175,6 +273,57 @@ class TestBufferAndEmit:
         assert fake_transport.shutdown_count == 1
 
 
+class TestAuthWiring:
+    """The resolved credential reaches the transport -- and nowhere else."""
+
+    def test_key_is_forwarded_to_the_transport(self, fake_transport):
+        OTLPSpanExporter("http://localhost:9000/ingest", api_key=_KEY)
+
+        assert fake_transport.captured["headers"] == {
+            "Authorization": f"Bearer {_KEY}"
+        }
+
+    def test_factory_forwards_the_key_too(self, fake_transport):
+        make_otlp_exporter("http://localhost:9000/ingest", api_key=_KEY)
+
+        assert fake_transport.captured["headers"] == {
+            "Authorization": f"Bearer {_KEY}"
+        }
+
+    def test_construction_raises_when_no_key_is_available(
+        self, fake_transport, monkeypatch
+    ):
+        monkeypatch.delenv(_API_KEY_ENV, raising=False)
+
+        with pytest.raises(ValueError, match=_API_KEY_ENV):
+            OTLPSpanExporter("http://localhost:9000/ingest")
+
+    def test_key_is_not_kept_on_the_exporter(self, fake_transport):
+        exporter = OTLPSpanExporter(
+            "http://localhost:9000/ingest", api_key=_KEY
+        )
+
+        # The credential lives in the transport's headers only, so it cannot
+        # surface through an attribute dump or a repr.
+        assert _KEY not in repr(vars(exporter))
+
+    def test_delivery_failure_warning_does_not_leak_the_key(self, monkeypatch):
+        transport = _RecordingTransport(raises=ConnectionError("refused"))
+        monkeypatch.setattr(
+            "argus.exporters.otlp._build_transport",
+            lambda endpoint, headers, timeout: transport,
+        )
+        exporter = OTLPSpanExporter(
+            "http://localhost:9000/ingest", api_key=_KEY
+        )
+        exporter.export(["span-a"])
+
+        with pytest.warns(RuntimeWarning) as recorded:
+            exporter.emit()
+
+        assert _KEY not in str(recorded[0].message)
+
+
 class TestDeliveryFailureIsReportedNotFatal:
     """A backend failure must warn (never crash) and keep the spans buffered.
 
@@ -245,9 +394,7 @@ class TestInitOtlpIntegration:
             "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://env:9000/v1/traces"
         )
 
-        session = argus.init(
-            "proj", otlp=True, output_dir=traces_dir, load_dotenv=False
-        )
+        session = argus.init("proj", otlp=True, output_dir=traces_dir)
 
         # OTLP rides alongside the default on-disk exporter, not instead of it.
         kinds = [type(e).__name__ for e in session.exporters]
@@ -262,16 +409,12 @@ class TestInitOtlpIntegration:
         self, use_instrumentors, fake_transport, traces_dir, monkeypatch
     ):
         use_instrumentors(make_instrumentor())
-        monkeypatch.delenv(
-            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", raising=False
-        )
+        monkeypatch.delenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", raising=False)
 
         # otlp=True with no endpoint anywhere is a misconfiguration: fail loudly
         # at init rather than silently posting to a guessed target.
         with pytest.raises(ValueError, match="OTLP endpoint"):
-            argus.init(
-                "proj", otlp=True, output_dir=traces_dir, load_dotenv=False
-            )
+            argus.init("proj", otlp=True, output_dir=traces_dir)
 
     def test_otlp_string_forwards_endpoint(
         self, use_instrumentors, fake_transport, traces_dir
@@ -282,7 +425,6 @@ class TestInitOtlpIntegration:
             "proj",
             otlp="http://localhost:9000/api/v1/trace/ingest",
             output_dir=traces_dir,
-            load_dotenv=False,
         )
 
         assert (
@@ -297,9 +439,7 @@ class TestInitOtlpIntegration:
         monkeypatch.setenv(
             "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://env:9000/v1/traces"
         )
-        session = argus.init(
-            "proj", otlp=True, output_dir=traces_dir, load_dotenv=False
-        )
+        session = argus.init("proj", otlp=True, output_dir=traces_dir)
 
         span = session.provider.get_tracer("test").start_span("work")
         span.end()
@@ -308,6 +448,68 @@ class TestInitOtlpIntegration:
         # Exactly one request, carrying the one span the run produced.
         assert len(fake_transport.exported) == 1
         assert len(fake_transport.exported[0]) == 1
+
+    def test_api_key_is_forwarded_to_the_otlp_exporter(
+        self, use_instrumentors, fake_transport, traces_dir, monkeypatch
+    ):
+        use_instrumentors(make_instrumentor())
+        monkeypatch.delenv(_API_KEY_ENV, raising=False)
+
+        argus.init(
+            "proj",
+            otlp="http://localhost:9000/api/v1/trace/ingest",
+            api_key=_KEY,
+            output_dir=traces_dir,
+        )
+
+        assert fake_transport.captured["headers"] == {
+            "Authorization": f"Bearer {_KEY}"
+        }
+
+    def test_api_key_read_from_the_environment(
+        self, use_instrumentors, fake_transport, traces_dir
+    ):
+        use_instrumentors(make_instrumentor())
+
+        # No api_key argument: the whole point of the env fallback is that a
+        # bare init still authenticates.
+        argus.init(
+            "proj",
+            otlp="http://localhost:9000/ingest",
+            output_dir=traces_dir,
+        )
+
+        assert fake_transport.captured["headers"] == {
+            "Authorization": f"Bearer {_KEY}"
+        }
+
+    def test_otlp_without_any_api_key_raises(
+        self, use_instrumentors, fake_transport, traces_dir, monkeypatch
+    ):
+        use_instrumentors(make_instrumentor())
+        monkeypatch.delenv(_API_KEY_ENV, raising=False)
+
+        with pytest.raises(ValueError, match=_API_KEY_ENV):
+            argus.init(
+                "proj",
+                otlp="http://localhost:9000/ingest",
+                output_dir=traces_dir,
+            )
+
+    def test_api_key_without_otlp_warns(
+        self, use_instrumentors, traces_dir, recording_exporter
+    ):
+        use_instrumentors(make_instrumentor())
+
+        # A key with no remote sink authenticates nothing; staying silent would
+        # read as acceptance.
+        with pytest.warns(RuntimeWarning, match="no otlp endpoint"):
+            argus.init(
+                "proj",
+                api_key=_KEY,
+                exporters=[recording_exporter],
+                output_dir=traces_dir,
+            )
 
     def test_otlp_off_by_default(
         self, use_instrumentors, recording_exporter, monkeypatch, traces_dir
@@ -323,7 +525,6 @@ class TestInitOtlpIntegration:
             "proj",
             exporters=[recording_exporter],
             output_dir=traces_dir,
-            load_dotenv=False,
         )
 
         assert session.exporters == [recording_exporter]

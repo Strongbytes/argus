@@ -25,7 +25,6 @@ class TestInit:
             "proj",
             exporters=[recording_exporter],
             output_dir=traces_dir,
-            load_dotenv=False,
         )
 
         assert isinstance(session, Session)
@@ -52,7 +51,6 @@ class TestInit:
             "proj",
             exporters=[recording_exporter],
             output_dir=traces_dir,
-            load_dotenv=False,
         )
 
         assert session.provider._atexit_handler is None
@@ -65,7 +63,6 @@ class TestInit:
             "my-project",
             service="my-service",
             exporters=[recording_exporter],
-            load_dotenv=False,
         )
 
         attributes = session.provider.resource.attributes
@@ -120,9 +117,7 @@ class TestSpanLimits:
         monkeypatch.delenv(self.ENV, raising=False)
         use_instrumentors()
 
-        session = argus.init(
-            "proj", exporters=[recording_exporter], load_dotenv=False
-        )
+        session = argus.init("proj", exporters=[recording_exporter])
 
         assert session.provider._span_limits.max_span_attributes == self.DEFAULT
 
@@ -134,9 +129,7 @@ class TestSpanLimits:
         # never loses its final output message to silent truncation.
         monkeypatch.delenv(self.ENV, raising=False)
         use_instrumentors()
-        session = argus.init(
-            "proj", exporters=[recording_exporter], load_dotenv=False
-        )
+        session = argus.init("proj", exporters=[recording_exporter])
 
         span = session.provider.get_tracer("test").start_span("response")
         for i in range(200):
@@ -153,12 +146,10 @@ class TestReinitGuard:
     ):
         inst = make_instrumentor()
         received = use_instrumentors(inst)
-        first = argus.init(
-            "proj", exporters=[recording_exporter], load_dotenv=False
-        )
+        first = argus.init("proj", exporters=[recording_exporter])
 
         with pytest.warns(RuntimeWarning, match="already been called"):
-            second = argus.init("proj", load_dotenv=False)
+            second = argus.init("proj")
 
         assert second is first
         # The second call did no work: no re-detection, no re-instrumentation.
@@ -167,10 +158,10 @@ class TestReinitGuard:
 
     def test_warning_names_both_projects_on_mismatch(self, use_instrumentors):
         use_instrumentors()
-        argus.init("alpha", load_dotenv=False)
+        argus.init("alpha")
 
         with pytest.warns(RuntimeWarning) as record:
-            argus.init("beta", load_dotenv=False)
+            argus.init("beta")
 
         message = str(record[0].message)
         assert "alpha" in message
@@ -178,12 +169,12 @@ class TestReinitGuard:
 
     def test_reinit_can_be_promoted_to_error(self, use_instrumentors):
         use_instrumentors()
-        argus.init("proj", load_dotenv=False)
+        argus.init("proj")
 
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             with pytest.raises(RuntimeWarning):
-                argus.init("proj", load_dotenv=False)
+                argus.init("proj")
 
         # Even when it raises, the original session is left intact.
         assert session_module._session is not None
@@ -194,9 +185,7 @@ class TestFlush:
         self, use_instrumentors, recording_exporter, monkeypatch
     ):
         use_instrumentors()
-        session = argus.init(
-            "proj", exporters=[recording_exporter], load_dotenv=False
-        )
+        session = argus.init("proj", exporters=[recording_exporter])
         monkeypatch.setattr(session_module, "_run_failed", True)
 
         session.flush()
@@ -207,9 +196,7 @@ class TestFlush:
         self, use_instrumentors, recording_exporter
     ):
         use_instrumentors()
-        session = argus.init(
-            "proj", exporters=[recording_exporter], load_dotenv=False
-        )
+        session = argus.init("proj", exporters=[recording_exporter])
 
         session.flush(failed=True)
 
@@ -217,9 +204,7 @@ class TestFlush:
 
     def test_is_idempotent(self, use_instrumentors, recording_exporter):
         use_instrumentors()
-        session = argus.init(
-            "proj", exporters=[recording_exporter], load_dotenv=False
-        )
+        session = argus.init("proj", exporters=[recording_exporter])
 
         session.flush()
         session.flush()
@@ -232,9 +217,7 @@ class TestContextManager:
         self, use_instrumentors, recording_exporter
     ):
         use_instrumentors()
-        with argus.init(
-            "proj", exporters=[recording_exporter], load_dotenv=False
-        ):
+        with argus.init("proj", exporters=[recording_exporter]):
             pass
 
         assert recording_exporter.emit_calls == [False]
@@ -244,9 +227,7 @@ class TestContextManager:
     ):
         use_instrumentors()
         with pytest.raises(ValueError, match="boom"):
-            with argus.init(
-                "proj", exporters=[recording_exporter], load_dotenv=False
-            ):
+            with argus.init("proj", exporters=[recording_exporter]):
                 raise ValueError("boom")
 
         assert recording_exporter.emit_calls == [True]
@@ -256,7 +237,7 @@ class TestReset:
     def test_uninstruments_and_clears_singleton(self, use_instrumentors):
         inst = make_instrumentor()
         use_instrumentors(inst)
-        argus.init("proj", load_dotenv=False)
+        argus.init("proj")
 
         session_module._reset()
 
@@ -266,13 +247,13 @@ class TestReset:
     def test_allows_a_fresh_init_afterwards(self, use_instrumentors):
         first_inst = make_instrumentor()
         use_instrumentors(first_inst)
-        first = argus.init("proj", load_dotenv=False)
+        first = argus.init("proj")
 
         session_module._reset()
 
         second_inst = make_instrumentor()
         use_instrumentors(second_inst)
-        second = argus.init("proj", load_dotenv=False)
+        second = argus.init("proj")
 
         assert second is not first
         assert second_inst.instrument_calls == [second.provider]
@@ -287,7 +268,7 @@ class TestReset:
     def test_survives_uninstrument_error(self, use_instrumentors):
         inst = RaisingUninstrumentor()
         use_instrumentors(inst)
-        argus.init("proj", load_dotenv=False)
+        argus.init("proj")
 
         session_module._reset()  # must not raise
 
@@ -300,7 +281,7 @@ class TestFlushOnExit:
         self, use_instrumentors, recording_exporter
     ):
         use_instrumentors()
-        argus.init("proj", exporters=[recording_exporter], load_dotenv=False)
+        argus.init("proj", exporters=[recording_exporter])
 
         session_module._flush_on_exit()
 
@@ -312,7 +293,7 @@ class TestFlushOnExit:
 
     def test_swallows_exporter_errors(self, use_instrumentors, monkeypatch):
         use_instrumentors()
-        session = argus.init("proj", load_dotenv=False)
+        session = argus.init("proj")
 
         def boom(*_, **__):
             raise RuntimeError("flush boom")

@@ -156,15 +156,22 @@ def _detect_script_name() -> str:
 def _load_dotenv() -> None:
     """Load a ``.env`` from the working directory, if python-dotenv is present.
 
-    Quietly does nothing when ``python-dotenv`` isn't installed, keeping the
-    dependency genuinely optional.
+    Run unconditionally by :func:`init`, which is what lets a key kept in
+    ``.env`` satisfy ``AEGIS_API_KEY`` with no argument passed. There is no
+    opt-out because there is nothing to opt out of: python-dotenv only ever
+    *fills in* variables (it leaves anything already in the environment
+    untouched, so a deployment's real configuration always wins), and a missing
+    file is a no-op. Quietly does nothing when ``python-dotenv`` isn't
+    installed, keeping the dependency genuinely optional.
     """
     try:
         from dotenv import find_dotenv, load_dotenv
     except ModuleNotFoundError:
         return
     # usecwd=True walks up from the working directory (where the script runs)
-    # rather than from inside the installed argus package.
+    # rather than from inside the installed argus package. The walk does mean a
+    # script in a monorepo can reach a .env in a shared parent; harmless given
+    # the no-override rule above, but it is why this is worth knowing about.
     load_dotenv(find_dotenv(usecwd=True))
 
 
@@ -241,7 +248,7 @@ def init(
     output_dir: Union[str, Path, None] = None,
     exporters: Optional[Sequence[SpanExporter]] = None,
     otlp: Union[bool, str, None] = None,
-    load_dotenv: bool = True,
+    api_key: Optional[str] = None,
 ) -> Session:
     """Configure tracing and turn on the right instrumentor(s).
 
@@ -270,11 +277,19 @@ def init(
             control, build the exporter with
             :func:`~argus.exporters.otlp.make_otlp_exporter` and pass it in
             ``exporters`` instead.
-        load_dotenv: Load environment variables from a ``.env`` file found from
-            the working directory.
+        api_key: Key authenticating the OTLP export, sent as
+            ``Authorization: Bearer <key>``. Falls back to the ``AEGIS_API_KEY``
+            env var (which is the recommended way to supply it -- an explicit
+            argument invites committing a live secret), and is required whenever
+            ``otlp`` is on. Applies only to the exporter ``otlp`` builds; a
+            hand-built exporter takes its own ``api_key``.
 
     Returns:
         A :class:`Session`; traces flush automatically on process exit.
+
+    A ``.env`` found from the working directory is loaded before anything is
+    resolved, so a key or endpoint kept there is picked up without being passed
+    (see :func:`_load_dotenv`).
 
     Calling ``init`` more than once in a process is a no-op: it warns and
     returns the already-active :class:`Session` unchanged. Because
@@ -287,8 +302,7 @@ def init(
         _warn_reinit(_session, project)
         return _session
 
-    if load_dotenv:
-        _load_dotenv()
+    _load_dotenv()
 
     base_dir = (
         Path(output_dir) if output_dir is not None else default_traces_dir()
@@ -335,7 +349,17 @@ def init(
     # ENDPOINT env var (and errors if that is unset).
     if otlp:
         endpoint = otlp if isinstance(otlp, str) else None
-        exporters.append(make_otlp_exporter(endpoint))
+        exporters.append(make_otlp_exporter(endpoint, api_key=api_key))
+    elif api_key is not None:
+        # A key with no remote sink to authenticate does nothing. Silence here
+        # would read as "the key was accepted", so name the missing half.
+        warnings.warn(
+            "argus.init() was given an api_key but no otlp endpoint, so the "
+            "key is unused and nothing is exported remotely. Pass otlp=True "
+            "(or otlp='https://your-backend/...') to enable remote export.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     # Every Argus exporter buffers spans and emits on exit, so SimpleSpanProcessor
     # (synchronous, no background queue that could drop under load) suits them
     # all; the actual send/write is deferred to each exporter's ``emit`` hook.

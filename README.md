@@ -103,7 +103,7 @@ pytest --cov --cov-report=html     # also write an htmlcov/ report to browse
 | `output_dir`  | `<cwd>/traces`       | Directory traces are written to.                                                                                                     |
 | `exporters`   | `[FileSpanExporter]` | Swap in your own OpenTelemetry exporters (e.g. OTLP).                                                                                |
 | `otlp`        | `None`               | Enable remote OTLP/HTTP export alongside the others. `True` reads the endpoint from `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` (raises if unset -- no default); a string sets the endpoint URL. See below. |
-| `load_dotenv` | `True`               | Load a `.env` found from the working directory.                                                                                      |
+| `api_key`     | `AEGIS_API_KEY`      | Key authenticating the OTLP export, sent as `Authorization: Bearer <key>`. Required whenever `otlp` is on; defaults to the `AEGIS_API_KEY` env var. See below. |
 
 `init` returns a `Session` that flushes automatically via `atexit`. It can also
 be used as a context manager for deterministic, scoped flushing:
@@ -127,8 +127,9 @@ pip install "argus-trace[otlp]"
 ```python
 import argus
 
-# otlp=True reads the endpoint from OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
-# (and raises if it is unset -- there is no default endpoint):
+# otlp=True reads the endpoint from OTEL_EXPORTER_OTLP_TRACES_ENDPOINT and the
+# API key from AEGIS_API_KEY (and raises if either is unset -- there is no
+# default endpoint, and ingest is authenticated):
 argus.init("my_project_name", otlp=True)
 
 # Or point it at your own ingest route explicitly:
@@ -140,10 +141,38 @@ rather than guess a target (and risk quietly shipping traces to the wrong
 backend) it requires one to be set. The endpoint is used verbatim as the POST
 URL (no `/v1/traces` path is appended for you). It can come from the `otlp=`
 argument or, when you pass `otlp=True`, from the standard
-`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` environment variable; auth headers /
-timeouts come from the usual `OTEL_EXPORTER_OTLP_TRACES_HEADERS` and
-`OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` vars. If neither the argument nor the env
-var supplies an endpoint, `init` raises `ValueError`.
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` environment variable; timeouts come from
+the usual `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` var. If neither the argument nor
+the env var supplies an endpoint, `init` raises `ValueError`.
+
+### Authentication
+
+Remote export is authenticated with an Aegis API key, sent as an
+`Authorization: Bearer <key>` header. Keep it in the environment so it never
+reaches your source -- `init` loads a `.env` found from your working directory,
+so this is enough on its own:
+
+```bash
+AEGIS_API_KEY=sk_...
+```
+
+```python
+argus.init("my_project_name", otlp=True)   # key read from AEGIS_API_KEY
+```
+
+Pass it explicitly when it comes from somewhere else, like a secrets manager:
+
+```python
+argus.init("my_project_name", otlp=True, api_key=fetch_secret("aegis"))
+```
+
+The key is **required** whenever `otlp` is on, and it is resolved and checked
+when `init` runs, so a missing or malformed key raises `ValueError` right at
+your `argus.init(...)` line. That is deliberate: because spans are buffered and
+POSTed once on exit, a credential rejected at send time would surface as a
+warning during interpreter shutdown -- with the run over and the whole trace
+already gone. There is no unauthenticated remote export; the local trace files
+are always written regardless.
 
 The OTLP exporter follows the same lifecycle as the file exporter: it **buffers
 spans in memory and POSTs the whole run once, on exit** (not streamed mid-run),
@@ -152,8 +181,10 @@ batches. The trade-off is identical to the file sink's -- a hard kill before exi
 loses the trace, since nothing was sent yet -- and a run's failure is carried on
 each span's own status rather than in a filename.
 
-For full control (custom headers, timeout, compression, a shared HTTP session),
-build the exporter yourself and pass it via `exporters=`:
+For full control (extra headers, timeout, compression, a shared HTTP session),
+build the exporter yourself and pass it via `exporters=`. Authentication still
+comes from `api_key`/`AEGIS_API_KEY` -- an `Authorization` entry in `headers`
+is rejected rather than silently overwritten:
 
 ```python
 from argus.exporters import make_otlp_exporter
@@ -163,7 +194,7 @@ argus.init(
     exporters=[
         make_otlp_exporter(
             "http://localhost:9000/api/v1/trace/ingest",
-            headers={"authorization": "Bearer …"},
+            api_key="sk_…",       # or leave it to AEGIS_API_KEY
             timeout=10,
         ),
     ],
