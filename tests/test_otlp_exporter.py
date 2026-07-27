@@ -29,6 +29,10 @@ from tests.factories import make_instrumentor
 _OTLP_MODULE = "opentelemetry.exporter.otlp.proto.http.trace_exporter"
 _API_KEY_ENV = "AEGIS_API_KEY"
 _AUTH_HEADER = "Authorization"
+# Both standard OTel endpoint vars: the traces-specific one is a complete URL,
+# the generic one a per-signal base that ``v1/traces`` is appended to.
+_TRACES_ENDPOINT_ENV = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"
+_ENDPOINT_ENV = "OTEL_EXPORTER_OTLP_ENDPOINT"
 # Shaped like a real Aegis key (``sk_`` + 32 chars) without being one; Argus
 # deliberately does not validate that shape, so nothing depends on it.
 _KEY = "sk_" + "a" * 32
@@ -77,6 +81,19 @@ def api_key_env(monkeypatch):
     monkeypatch.setenv(_API_KEY_ENV, _KEY)
 
 
+@pytest.fixture(autouse=True)
+def clean_endpoint_env(monkeypatch):
+    """Clear both OTLP endpoint vars so the suite ignores the real environment.
+
+    Endpoint resolution reads two variables, and a developer running the suite
+    on a machine configured to talk to a collector would otherwise satisfy the
+    tests asserting that a missing endpoint raises. Tests that want one set it
+    themselves.
+    """
+    monkeypatch.delenv(_TRACES_ENDPOINT_ENV, raising=False)
+    monkeypatch.delenv(_ENDPOINT_ENV, raising=False)
+
+
 @pytest.fixture
 def fake_transport(monkeypatch):
     """Patch transport construction so no real OTLP dependency is needed.
@@ -100,7 +117,7 @@ def fake_transport(monkeypatch):
 
 
 class TestResolveEndpoint:
-    ENV = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"
+    ENV = _TRACES_ENDPOINT_ENV
 
     def test_explicit_argument_wins(self, monkeypatch):
         monkeypatch.setenv(self.ENV, "http://env:9000/v1/traces")
@@ -115,13 +132,66 @@ class TestResolveEndpoint:
 
         assert _resolve_endpoint(None) == "http://env:9000/v1/traces"
 
-    def test_raises_when_no_endpoint_configured(self, monkeypatch):
-        # No explicit endpoint and no env var: Argus has no default, so this
-        # is a misconfiguration we surface loudly rather than guessing a target.
-        monkeypatch.delenv(self.ENV, raising=False)
-
-        with pytest.raises(ValueError, match=self.ENV):
+    def test_raises_when_no_endpoint_configured(self):
+        # No explicit endpoint and neither env var: Argus has no default, so
+        # this is a misconfiguration we surface loudly rather than guess a
+        # target. Both variables are named so the fix is obvious.
+        with pytest.raises(ValueError, match=self.ENV) as excinfo:
             _resolve_endpoint(None)
+
+        assert _ENDPOINT_ENV in str(excinfo.value)
+
+
+class TestResolveGenericEndpoint:
+    """The generic, all-signals ``OTEL_EXPORTER_OTLP_ENDPOINT`` fallback.
+
+    It is the variable a collector deployment normally sets, and OpenTelemetry's
+    own exporter honors it by appending the traces path. Argus reads the endpoint
+    itself (to fail early when nothing is configured), so it has to reproduce
+    that rule or it would reject a perfectly standard setup.
+    """
+
+    def test_generic_var_gets_the_traces_path_appended(self, monkeypatch):
+        monkeypatch.setenv(_ENDPOINT_ENV, "http://collector:4318")
+
+        assert _resolve_endpoint(None) == "http://collector:4318/v1/traces"
+
+    def test_trailing_slash_does_not_double_up(self, monkeypatch):
+        monkeypatch.setenv(_ENDPOINT_ENV, "http://collector:4318/")
+
+        assert _resolve_endpoint(None) == "http://collector:4318/v1/traces"
+
+    def test_path_is_preserved_under_a_base_route(self, monkeypatch):
+        # A collector behind a path prefix: the traces route hangs off it.
+        monkeypatch.setenv(_ENDPOINT_ENV, "http://gateway/otlp")
+
+        assert _resolve_endpoint(None) == "http://gateway/otlp/v1/traces"
+
+    def test_traces_specific_var_wins_and_is_used_verbatim(self, monkeypatch):
+        monkeypatch.setenv(_ENDPOINT_ENV, "http://collector:4318")
+        monkeypatch.setenv(_TRACES_ENDPOINT_ENV, "http://direct:9000/ingest")
+
+        # The signal-specific variable is already a complete route, so nothing
+        # is appended to it.
+        assert _resolve_endpoint(None) == "http://direct:9000/ingest"
+
+    def test_explicit_argument_still_wins(self, monkeypatch):
+        monkeypatch.setenv(_ENDPOINT_ENV, "http://collector:4318")
+
+        assert _resolve_endpoint("http://arg/ingest") == "http://arg/ingest"
+
+    def test_init_accepts_a_collector_configured_the_standard_way(
+        self, use_instrumentors, fake_transport, traces_dir, monkeypatch
+    ):
+        use_instrumentors(make_instrumentor())
+        monkeypatch.setenv(_ENDPOINT_ENV, "http://collector:4318")
+
+        argus.init("proj", otlp=True, output_dir=traces_dir)
+
+        assert (
+            fake_transport.captured["endpoint"]
+            == "http://collector:4318/v1/traces"
+        )
 
 
 class TestResolveAuthHeaders:
@@ -290,6 +360,29 @@ class TestAuthWiring:
             "Authorization": f"Bearer {_KEY}"
         }
 
+    def test_headers_are_always_passed_to_the_transport(self, fake_transport):
+        # No headers argument, no api_key argument -- and the transport is still
+        # handed an explicit mapping. That is what keeps the transport's own
+        # OTEL_EXPORTER_OTLP_*_HEADERS variables permanently inert: it reads
+        # them only when it is given no headers at all.
+        OTLPSpanExporter("http://localhost:9000/ingest")
+
+        assert fake_transport.captured["headers"] == {
+            _AUTH_HEADER: f"Bearer {_KEY}"
+        }
+
+    def test_extra_headers_ride_alongside_the_credential(self, fake_transport):
+        # The headers argument is the documented way to add headers, precisely
+        # because the environment variables cannot be.
+        OTLPSpanExporter(
+            "http://localhost:9000/ingest", headers={"x-tenant": "acme"}
+        )
+
+        assert fake_transport.captured["headers"] == {
+            "x-tenant": "acme",
+            _AUTH_HEADER: f"Bearer {_KEY}",
+        }
+
     def test_construction_raises_when_no_key_is_available(
         self, fake_transport, monkeypatch
     ):
@@ -406,13 +499,13 @@ class TestInitOtlpIntegration:
         )
 
     def test_otlp_true_without_endpoint_raises(
-        self, use_instrumentors, fake_transport, traces_dir, monkeypatch
+        self, use_instrumentors, fake_transport, traces_dir
     ):
         use_instrumentors(make_instrumentor())
-        monkeypatch.delenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", raising=False)
 
         # otlp=True with no endpoint anywhere is a misconfiguration: fail loudly
-        # at init rather than silently posting to a guessed target.
+        # at init rather than silently posting to a guessed target. (The autouse
+        # clean_endpoint_env fixture cleared both endpoint variables.)
         with pytest.raises(ValueError, match="OTLP endpoint"):
             argus.init("proj", otlp=True, output_dir=traces_dir)
 
@@ -431,6 +524,51 @@ class TestInitOtlpIntegration:
             fake_transport.captured["endpoint"]
             == "http://localhost:9000/api/v1/trace/ingest"
         )
+
+    def test_otlp_string_is_stripped_before_use(
+        self, use_instrumentors, fake_transport, traces_dir
+    ):
+        use_instrumentors(make_instrumentor())
+
+        # An endpoint read out of a file or a shell often arrives with a
+        # trailing newline, which would make every POST fail.
+        argus.init(
+            "proj",
+            otlp="  http://localhost:9000/ingest\n",
+            output_dir=traces_dir,
+        )
+
+        assert (
+            fake_transport.captured["endpoint"]
+            == "http://localhost:9000/ingest"
+        )
+
+    @pytest.mark.parametrize("value", ["", "   ", "\n"])
+    def test_blank_otlp_string_raises_instead_of_disabling(
+        self, value, use_instrumentors, fake_transport, traces_dir
+    ):
+        use_instrumentors(make_instrumentor())
+
+        # A blank string is what os.getenv("ENDPOINT", "") yields when the
+        # variable is missing. Empty, it is falsy and would turn export off over
+        # a configuration slip; whitespace-only, it is truthy and would reach
+        # the transport as a nonsense URL. Neither is worth guessing at.
+        with pytest.raises(ValueError, match="empty otlp endpoint"):
+            argus.init("proj", otlp=value, output_dir=traces_dir)
+
+    def test_blank_otlp_string_does_not_blame_a_missing_endpoint(
+        self, use_instrumentors, fake_transport, traces_dir, recwarn
+    ):
+        use_instrumentors(make_instrumentor())
+
+        with pytest.raises(ValueError):
+            argus.init("proj", otlp="", api_key=_KEY, output_dir=traces_dir)
+
+        # The old failure mode: export off, and the unused-key warning telling
+        # the caller they forgot an endpoint they had in fact supplied.
+        assert [
+            w for w in recwarn if "no otlp endpoint" in str(w.message)
+        ] == []
 
     def test_flush_emits_buffered_spans_to_the_backend(
         self, use_instrumentors, fake_transport, traces_dir, monkeypatch
@@ -497,7 +635,7 @@ class TestInitOtlpIntegration:
             )
 
     def test_api_key_without_otlp_warns(
-        self, use_instrumentors, traces_dir, recording_exporter
+        self, use_instrumentors, recording_exporter
     ):
         use_instrumentors(make_instrumentor())
 
@@ -508,11 +646,10 @@ class TestInitOtlpIntegration:
                 "proj",
                 api_key=_KEY,
                 exporters=[recording_exporter],
-                output_dir=traces_dir,
             )
 
     def test_otlp_off_by_default(
-        self, use_instrumentors, recording_exporter, monkeypatch, traces_dir
+        self, use_instrumentors, recording_exporter, monkeypatch
     ):
         use_instrumentors(make_instrumentor())
 
@@ -521,10 +658,6 @@ class TestInitOtlpIntegration:
 
         monkeypatch.setattr(session_module, "make_otlp_exporter", boom)
 
-        session = argus.init(
-            "proj",
-            exporters=[recording_exporter],
-            output_dir=traces_dir,
-        )
+        session = argus.init("proj", exporters=[recording_exporter])
 
         assert session.exporters == [recording_exporter]

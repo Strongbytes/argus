@@ -5,16 +5,22 @@ exporters do real I/O, so the suite never touches either. Instead these
 factories build lightweight stand-ins that mimic exactly the surface Argus
 relies on:
 
-* :class:`FakeInstrumentor` -- the slice of the OpenTelemetry
-  ``BaseInstrumentor`` API that :func:`argus.init` and :func:`argus._reset`
-  call (``instrument`` / ``uninstrument``), with call recording.
+* :class:`FakeInstrumentor` (built by :func:`make_instrumentor`) -- the slice of
+  the OpenTelemetry ``BaseInstrumentor`` API that :func:`argus.init` and
+  :func:`argus.reset` call (``instrument`` / ``uninstrument``), with call
+  recording.
+* :class:`RaisingUninstrumentor` -- the same fake with a failing
+  ``uninstrument``, so a test can assert that :func:`argus.reset` tears the
+  session down anyway rather than propagating a sink's teardown error.
 * :class:`RecordingExporter` -- a real :class:`SpanExporter` that records the
   spans it is handed and the ``emit`` flushes Argus drives on exit.
+* :class:`PlainSpanExporter` -- the same, minus the ``emit`` hook, standing in
+  for any third-party exporter passed via ``exporters=``.
 * :func:`make_span` -- a real :class:`~opentelemetry.sdk.trace.ReadableSpan`
-  with a caller-chosen trace id, start time, and attributes. The file exporter
-  now encodes buffered spans with the OTLP span encoder, which needs genuine
-  ``ReadableSpan`` objects (context, resource, scope, timings), so a hand-rolled
-  stand-in no longer suffices.
+  with a caller-chosen trace id, start time, and attributes. It has to be
+  genuine (context, resource, scope, timings) because the file exporter encodes
+  buffered spans with the OTLP span encoder, which a hand-rolled stand-in cannot
+  satisfy.
 * :func:`patch_resolve_instrumentors` -- swaps the framework-detection seam so
   ``init`` turns on the fakes we hand it instead of probing the environment.
 """
@@ -89,6 +95,34 @@ class RecordingExporter(SpanExporter):
         self.emit_calls.append(failed)
 
     def force_flush(self, timeout_millis: int = 30_000) -> bool:
+        return True
+
+    def shutdown(self) -> None:
+        self.shutdown_count += 1
+
+
+class PlainSpanExporter(SpanExporter):
+    """A stock ``SpanExporter`` with no ``emit`` hook, as a third party's would be.
+
+    :class:`RecordingExporter` covers exporters that opt into Argus's
+    buffer-now/emit-once lifecycle; this covers the other half of the
+    ``exporters=`` contract. Argus must drive it the ordinary OpenTelemetry way
+    -- spans handed over as they end, ``force_flush`` when the session flushes,
+    ``shutdown`` at process exit -- because nothing else in the pipeline will
+    (Argus disables the provider's own shutdown handler).
+    """
+
+    def __init__(self) -> None:
+        self.exported_spans: List[Any] = []
+        self.force_flush_count = 0
+        self.shutdown_count = 0
+
+    def export(self, spans: Sequence[Any]) -> SpanExportResult:
+        self.exported_spans.extend(spans)
+        return SpanExportResult.SUCCESS
+
+    def force_flush(self, timeout_millis: int = 30_000) -> bool:
+        self.force_flush_count += 1
         return True
 
     def shutdown(self) -> None:

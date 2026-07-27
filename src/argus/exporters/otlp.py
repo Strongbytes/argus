@@ -3,10 +3,10 @@
 This is the remote sibling of :class:`~argus.exporters.file.FileSpanExporter`,
 and it deliberately shares that sink's whole philosophy: **buffer now, emit
 once**. Spans are accumulated in memory as they end and nothing leaves the
-process until Argus calls :meth:`~OTLPSpanExporter.emit` exactly once, on exit,
-when the run's outcome is known. Where the file exporter's ``emit`` writes a
-JSON file, this one POSTs every buffered span to a backend in a single
-OTLP/HTTP (protobuf) request.
+process until Argus calls :meth:`~OTLPSpanExporter.emit` on exit, when the run's
+outcome is known. Where the file exporter's ``emit`` writes a JSON file, this
+one POSTs every buffered span to a backend in a single OTLP/HTTP (protobuf)
+request.
 
 Mirroring the file sink -- rather than adopting OpenTelemetry's usual streaming
 model, where a ``BatchSpanProcessor`` trickles spans out mid-run -- buys three
@@ -29,10 +29,25 @@ flushes and tags the run.
 We do not reimplement the wire protocol. OpenTelemetry's own OTLP/HTTP exporter
 (the "transport" here) already handles protobuf encoding, gzip, retries, and the
 standard ``OTEL_EXPORTER_OTLP_*`` environment variables; we simply hand it every
-buffered span in one ``export`` call at the end. That transport lives in the
-optional ``argus-trace[otlp]`` extra, so it is imported when an exporter is
-constructed (i.e. when you actually ask for OTLP) -- a missing extra fails loudly
-and early at :func:`argus.init` time rather than silently at exit.
+buffered span in one ``export`` call at the end. Two of those settings Argus
+does not leave to it:
+
+* **The endpoint pair.** ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` and
+  ``OTEL_EXPORTER_OTLP_ENDPOINT`` are read here (see
+  :func:`_resolve_endpoint`), because Argus has to fail early when neither is
+  set instead of falling back to the transport's ``http://localhost:4318``.
+* **The headers pair.** ``OTEL_EXPORTER_OTLP_TRACES_HEADERS`` and
+  ``OTEL_EXPORTER_OTLP_HEADERS`` never take effect, because the transport reads
+  them only when no ``headers`` argument was passed -- and Argus always passes
+  one, since that is where the resolved credential travels (see
+  :func:`_resolve_auth_headers`). Extra headers therefore go in the ``headers``
+  argument rather than the environment.
+
+Everything else the transport reads -- ``OTEL_EXPORTER_OTLP_TRACES_TIMEOUT``,
+compression, TLS material -- still reaches it untouched. The transport itself
+lives in the optional ``argus-trace[otlp]`` extra, so it is imported when an
+exporter is constructed (i.e. when you actually ask for OTLP) -- a missing extra
+fails loudly and early at :func:`argus.init` time rather than silently at exit.
 
 Ingest endpoints are authenticated, so an API key is part of the configuration
 here alongside the endpoint (see :func:`_resolve_auth_headers`). It is resolved
@@ -51,11 +66,16 @@ from typing import List, Mapping, Optional, Sequence
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 
-# Standard OpenTelemetry env var naming the traces endpoint. Honored so an
-# operator can point exports at their own backend without touching code -- and,
-# deliberately, the *only* fallback: Argus ships no built-in default endpoint
-# (see :func:`_resolve_endpoint`).
+# Standard OpenTelemetry env vars naming the endpoint, honored so an operator can
+# point exports at their own backend without touching code. The traces-specific
+# one is a complete URL; the generic one is a base shared by every signal, to
+# which the traces path below is appended (see :func:`_resolve_endpoint`). They
+# are deliberately the only fallbacks: Argus ships no built-in default endpoint.
 _OTLP_TRACES_ENDPOINT_ENV_VAR = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"
+_OTLP_ENDPOINT_ENV_VAR = "OTEL_EXPORTER_OTLP_ENDPOINT"
+# The path OpenTelemetry appends to a generic (all-signals) OTLP/HTTP base URL to
+# reach the traces route.
+_TRACES_EXPORT_PATH = "v1/traces"
 
 # Where the API key comes from when it isn't passed explicitly. Named for Aegis
 # rather than Argus because the credential is issued and validated by the Aegis
@@ -69,27 +89,42 @@ _AUTH_HEADER = "Authorization"
 def _resolve_endpoint(endpoint: Optional[str]) -> str:
     """Decide the URL spans are POSTed to, most explicit source winning.
 
-    Precedence: an explicit ``endpoint`` argument, then the standard
-    ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` environment variable. There is no
-    built-in default. Argus is a library anyone may install, so a hardcoded
-    endpoint would either silently ship a stranger's traces to someone else's
-    backend or point at a machine-local address that is meaningless to the
-    caller; when neither source supplies an endpoint we raise instead of
-    guessing. Kept separate from the exporter so the resolution rules can be
-    exercised without importing the optional OTLP dependency.
+    Precedence follows OpenTelemetry's own: an explicit ``endpoint`` argument,
+    then the signal-specific ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT``, then the
+    generic ``OTEL_EXPORTER_OTLP_ENDPOINT``. The first two are used verbatim as
+    the POST URL; the generic one is a base shared by every signal (it is what a
+    collector deployment usually sets), so ``v1/traces`` is appended to it, which
+    is what the standard says and what OpenTelemetry's own exporter does. Honor
+    the generic variable and a collector configured the ordinary way just works,
+    instead of Argus refusing over a variable it could plainly have read.
+
+    Where OpenTelemetry would then fall back to ``http://localhost:4318``, Argus
+    stops and raises. It is a library anyone may install, so a hardcoded endpoint
+    would either silently ship a stranger's traces to someone else's backend or
+    point at a machine-local address meaningless to the caller. Kept separate
+    from the exporter so the resolution rules can be exercised without importing
+    the optional OTLP dependency.
 
     Raises:
-        ValueError: If neither an explicit ``endpoint`` nor the
-            ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` environment variable is set.
+        ValueError: If no explicit ``endpoint`` is given and neither environment
+            variable is set.
     """
-    resolved = endpoint or os.environ.get(_OTLP_TRACES_ENDPOINT_ENV_VAR)
-    if not resolved:
-        raise ValueError(
-            "No OTLP endpoint configured. Pass one explicitly (e.g. "
-            "argus.init(..., otlp='https://your-backend/v1/traces')) or set "
-            f"the {_OTLP_TRACES_ENDPOINT_ENV_VAR} environment variable."
-        )
-    return resolved
+    if endpoint:
+        return endpoint
+    traces_endpoint = os.environ.get(_OTLP_TRACES_ENDPOINT_ENV_VAR)
+    if traces_endpoint:
+        return traces_endpoint
+    base = os.environ.get(_OTLP_ENDPOINT_ENV_VAR)
+    if base:
+        separator = "" if base.endswith("/") else "/"
+        return f"{base}{separator}{_TRACES_EXPORT_PATH}"
+    raise ValueError(
+        "No OTLP endpoint configured. Pass one explicitly (e.g. "
+        "argus.init(..., otlp='https://your-backend/v1/traces')) or set "
+        f"the {_OTLP_TRACES_ENDPOINT_ENV_VAR} environment variable (or "
+        f"{_OTLP_ENDPOINT_ENV_VAR}, to which /{_TRACES_EXPORT_PATH} is "
+        "appended)."
+    )
 
 
 def _resolve_auth_headers(
@@ -107,7 +142,10 @@ def _resolve_auth_headers(
     A key is mandatory: remote export exists to reach Aegis, whose ingest route
     is authenticated, so there is no unauthenticated configuration worth
     supporting. Any ``headers`` given are merged around the resolved
-    ``Authorization: Bearer <key>``, never in place of it.
+    ``Authorization: Bearer <key>``, never in place of it. The result is always
+    handed to the transport as an explicit ``headers`` argument, which is why
+    the transport's own ``OTEL_EXPORTER_OTLP_*_HEADERS`` variables never take
+    effect.
 
     Returns:
         The headers to hand the transport -- the caller's, plus the bearer
@@ -127,9 +165,9 @@ def _resolve_auth_headers(
     if not resolved:
         raise ValueError(
             "No Aegis API key configured. Set the "
-            f"{_API_KEY_ENV_VAR} environment variable (a .env file in your "
-            "working directory is read for you) or pass one explicitly, e.g. "
-            "argus.init(..., otlp=True, api_key='sk_...')."
+            f"{_API_KEY_ENV_VAR} environment variable (a .env file in or above "
+            "your working directory is read for you) or pass one explicitly, "
+            "e.g. argus.init(..., otlp=True, api_key='sk_...')."
         )
     if any(char.isspace() for char in resolved):
         raise ValueError(
@@ -150,7 +188,7 @@ def _resolve_auth_headers(
 
 def _build_transport(
     endpoint: str,
-    headers: Optional[Mapping[str, str]],
+    headers: Mapping[str, str],
     timeout: Optional[int],
 ) -> SpanExporter:
     """Construct the underlying OpenTelemetry OTLP/HTTP exporter.
@@ -159,6 +197,12 @@ def _build_transport(
     function (rather than inline in :meth:`OTLPSpanExporter.__init__`) so the
     test suite can substitute a fake transport and never needs the real
     ``argus-trace[otlp]`` extra installed.
+
+    ``headers`` is always a real mapping -- it carries the credential, so there
+    is no unauthenticated call to make -- which is what puts the transport's
+    ``OTEL_EXPORTER_OTLP_*_HEADERS`` variables permanently out of play. Only
+    ``timeout`` is optional; omitting it leaves the transport on its own default
+    (which does read ``OTEL_EXPORTER_OTLP_TRACES_TIMEOUT``).
 
     Raises:
         ImportError: If the extra is not installed, re-raised with a message
@@ -174,9 +218,7 @@ def _build_transport(
             "with: pip install 'argus-trace[otlp]'"
         ) from exc
 
-    kwargs: dict = {"endpoint": endpoint}
-    if headers is not None:
-        kwargs["headers"] = dict(headers)
+    kwargs: dict = {"endpoint": endpoint, "headers": dict(headers)}
     if timeout is not None:
         kwargs["timeout"] = timeout
     return _HTTPExporter(**kwargs)
@@ -187,7 +229,8 @@ class OTLPSpanExporter(SpanExporter):
 
     The remote counterpart to :class:`~argus.exporters.file.FileSpanExporter`:
     same buffer-now/emit-once lifecycle, same :meth:`emit` hook Argus drives on
-    process exit -- only the destination differs.
+    process exit. The destination is the difference -- and, because spans cannot
+    be un-POSTed, so is what a repeat emit does (see :meth:`emit`).
     """
 
     def __init__(
@@ -201,18 +244,23 @@ class OTLPSpanExporter(SpanExporter):
         """Prepare an exporter pointed at a backend ingest endpoint.
 
         Args:
-            endpoint: Full URL to POST spans to. When omitted, falls back to
-                the ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` env var; if that is
-                unset too a :class:`ValueError` is raised, since Argus has no
-                default endpoint. Used verbatim -- no ``/v1/traces`` path is
-                appended -- so it must be the complete route.
+            endpoint: Full URL to POST spans to, used verbatim -- no
+                ``/v1/traces`` path is appended -- so it must be the complete
+                route. When omitted, falls back to the
+                ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` env var (also verbatim)
+                and then to ``OTEL_EXPORTER_OTLP_ENDPOINT`` (a per-signal base,
+                so ``v1/traces`` *is* appended to that one). With none of the
+                three set a :class:`ValueError` is raised, since Argus has no
+                default endpoint. See :func:`_resolve_endpoint`.
             api_key: Key authenticating the export, sent as
                 ``Authorization: Bearer <key>``. Required; falls back to the
                 ``AEGIS_API_KEY`` env var. See :func:`_resolve_auth_headers`.
             headers: Extra HTTP headers sent alongside the credential (e.g.
-                routing or tenant hints). Note that because Argus always passes
-                headers to the transport now, the transport's own
-                ``OTEL_EXPORTER_OTLP_TRACES_HEADERS`` env var is ignored.
+                routing or tenant hints). This is the only way to add headers:
+                the transport's ``OTEL_EXPORTER_OTLP_TRACES_HEADERS`` and
+                ``OTEL_EXPORTER_OTLP_HEADERS`` env vars never take effect,
+                because Argus always passes headers explicitly to carry the
+                credential (see :func:`_resolve_auth_headers`).
             timeout: Per-export timeout in seconds; falls back to the
                 transport's own default (honoring
                 ``OTEL_EXPORTER_OTLP_TRACES_TIMEOUT``) when omitted.
@@ -224,10 +272,9 @@ class OTLPSpanExporter(SpanExporter):
         so it cannot leak through a warning or a repr.
 
         Raises:
-            ValueError: If no ``endpoint`` is given and the
-                ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` env var is unset, or if
-                the API key is missing or unusable (see
-                :func:`_resolve_auth_headers`).
+            ValueError: If no ``endpoint`` is given and neither endpoint env var
+                is set (see :func:`_resolve_endpoint`), or if the API key is
+                missing or unusable (see :func:`_resolve_auth_headers`).
             ImportError: If the optional ``otlp`` extra is not installed.
         """
         self._endpoint = _resolve_endpoint(endpoint)
@@ -251,9 +298,8 @@ class OTLPSpanExporter(SpanExporter):
     def emit(self, failed: bool = False) -> None:
         """POST every buffered span to the endpoint in a single request.
 
-        Argus calls this exactly once, on exit. All buffered spans (across every
-        trace in the run) go out in one OTLP request; an empty buffer sends
-        nothing.
+        Argus calls this on exit, and all buffered spans (across every trace in
+        the run) go out in one OTLP request; an empty buffer sends nothing.
 
         Delivery failures are reported, never fatal. Argus is a side-channel: a
         backend that is down, slow, or rejects the batch must not crash the run
@@ -264,8 +310,14 @@ class OTLPSpanExporter(SpanExporter):
         exception for callers who want strictness). Note the transport reports a
         rejected batch by *return value* (it retries retryable statuses, then
         gives up) rather than by raising, so both the returned
-        :class:`SpanExportResult` and a rare raise are handled. The buffer is
-        emptied only on a confirmed success, leaving the spans intact otherwise.
+        :class:`SpanExportResult` and a rare raise are handled.
+
+        The buffer is emptied only on a confirmed success, which is what makes a
+        repeat call safe in both directions: spans a failed attempt left behind
+        get another chance on the next emit, while spans the backend has already
+        accepted are never sent twice. So a repeat call after a clean send does
+        nothing -- unlike the file sink, which keeps its buffer, because
+        rewriting a file supersedes it where a second POST would duplicate.
 
         ``failed`` is accepted for parity with the buffered-exporter contract
         (the same hook the file sink uses to tag its filename). The remote
@@ -324,9 +376,8 @@ def make_otlp_exporter(
     argument meanings.
 
     Raises:
-        ValueError: If no ``endpoint`` is given and the
-            ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` env var is unset, or if the
-            API key is missing or unusable.
+        ValueError: If no ``endpoint`` is given and neither endpoint env var is
+            set, or if the API key is missing or unusable.
         ImportError: If the optional ``argus-trace[otlp]`` extra is not
             installed.
     """

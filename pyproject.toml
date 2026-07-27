@@ -1,7 +1,7 @@
 [project]
 name = "argus-trace"
 version = "0.6.0"
-description = "A thin wrapper over OpenInference + OpenTelemetry that captures LLM agent traces to disk (and, later, to a remote endpoint)."
+description = "A thin wrapper over OpenInference + OpenTelemetry that captures LLM agent traces to disk and to a remote OTLP endpoint."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -24,7 +24,29 @@ agno = [
     "openinference-instrumentation-agno",
     "openinference-instrumentation-openai",
 ]
+# Matches the curated ``openai`` key, for a script calling the OpenAI client
+# directly rather than through an agent framework.
+openai = ["openinference-instrumentation-openai"]
 otlp = ["opentelemetry-exporter-otlp-proto-http>=1.30"]
+
+# The tooling for working on Argus itself, kept in a PEP 735 dependency group
+# rather than an extra: an extra is published in the distribution's metadata (so
+# ``pip install argus-trace[dev]`` would become part of the package's contract),
+# while a group is a local development concern only. Install it from a checkout
+# with ``pip install -e . --group dev`` (pip 25.1+).
+#
+# Exact pins here, unlike the ranges above: this list configures one machine
+# rather than every installation, and a formatter that drifts a minor version
+# reformats files out from under the next contributor. The runtime dependencies
+# stay loose because a library must coexist with whatever its host resolved.
+[dependency-groups]
+dev = [
+    "black==25.1.0",
+    "commitizen==4.16.4",
+    "isort==6.0.1",
+    "pytest==9.0.2",
+    "pytest-cov==7.1.0",
+]
 
 [build-system]
 requires = ["setuptools>=68"]

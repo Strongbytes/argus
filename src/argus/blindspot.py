@@ -30,6 +30,12 @@ The same object works three ways::
     @argus.blindspot()                 # whole function, sync or async
     def internal_workflow(...):
         ...
+
+The decorator covers ordinary and ``async def`` functions. It refuses generator
+and async-generator functions with a :class:`TypeError`, because a generator
+borrows its consumer's context and suppression therefore cannot be confined to
+its body -- wrap the loop that consumes it instead (see
+:func:`_reject_generator`).
 """
 
 from __future__ import annotations
@@ -46,6 +52,48 @@ from opentelemetry.context import (
 )
 
 F = TypeVar("F", bound=Callable[..., Any])
+
+
+def _reject_generator(func: Callable[..., Any]) -> None:
+    """Refuse to decorate a generator function, explaining what to do instead.
+
+    A generator does not get a context of its own the way a coroutine does: it
+    runs in whatever context its consumer is in. So a wrapper holding the
+    suppression across a ``yield`` cannot confine it to the generator's body --
+    the flag stays attached while the consumer runs too, quietly suppressing
+    code the caller never meant to hide. Nor can the wrapper simply not hold it,
+    because the body would then run unsuppressed, which is worse: the decorator
+    would look like it was protecting a sensitive stream while doing nothing.
+
+    Both failure modes are silent, and for a feature whose whole job is keeping
+    payloads off the record, silence is the one thing we cannot ship. So we
+    refuse at decoration time -- when the mistake is cheap to fix -- and name the
+    pattern that does work: wrap the *consumption* of the generator, which
+    covers the body and the consumer alike, deliberately.
+
+    Raises:
+        TypeError: If ``func`` is a generator or async-generator function.
+    """
+    if inspect.isasyncgenfunction(func):
+        kind, opener, loop = (
+            "an async generator function",
+            "async with",
+            "async for",
+        )
+    elif inspect.isgeneratorfunction(func):
+        kind, opener, loop = "a generator function", "with", "for"
+    else:
+        return
+    name = getattr(func, "__name__", "<anonymous>")
+    raise TypeError(
+        f"argus.blindspot() cannot decorate {name!r} because it is {kind}. A "
+        "generator runs inside its consumer's context, so the suppression "
+        "would leak into the consumer between yields instead of covering only "
+        "the generator's body. Wrap the point of consumption instead:\n\n"
+        f"    {opener} argus.blindspot():\n"
+        f"        {loop} item in {name}(...):\n"
+        "            ...\n"
+    )
 
 
 class blindspot:
@@ -107,7 +155,14 @@ class blindspot:
         body; plain functions get a synchronous wrapper. A fresh
         :class:`blindspot` is used per invocation so the decorator is safe under
         recursion and concurrency.
+
+        Raises:
+            TypeError: If ``func`` is a generator or async-generator function.
+                Suppression cannot be scoped to a generator's body (see
+                :func:`_reject_generator`), so rather than decorate one
+                misleadingly we refuse and point at the pattern that works.
         """
+        _reject_generator(func)
         if inspect.iscoroutinefunction(func):
 
             @functools.wraps(func)

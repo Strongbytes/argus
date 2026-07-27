@@ -113,6 +113,80 @@ class TestDecorator:
         assert not suppressed()
 
 
+class TestGeneratorsAreRejected:
+    """Decorating a generator function raises instead of failing silently.
+
+    A generator borrows its consumer's context, so a decorator cannot confine
+    suppression to the generator's body: hold it across a ``yield`` and it leaks
+    into the consumer, release it and the body runs unsuppressed. Both are
+    silent, and silence is unacceptable for a feature whose job is keeping
+    payloads off the record -- so this refuses at decoration time.
+    """
+
+    def test_sync_generator_function_raises(self):
+        with pytest.raises(TypeError, match="generator function"):
+
+            @argus.blindspot()
+            def streaming():
+                yield 1
+
+    def test_async_generator_function_raises(self):
+        with pytest.raises(TypeError, match="async generator function"):
+
+            @argus.blindspot()
+            async def streaming():
+                yield 1
+
+    def test_error_names_the_function_and_the_working_pattern(self):
+        def stream_answer():
+            yield 1
+
+        with pytest.raises(TypeError) as excinfo:
+            argus.blindspot()(stream_answer)
+
+        message = str(excinfo.value)
+        assert "stream_answer" in message
+        # The message has to carry the fix, since the whole point is that the
+        # caller cannot see the failure any other way.
+        assert "with argus.blindspot():" in message
+        assert "for item in stream_answer(...)" in message
+
+    def test_async_error_suggests_async_with_and_async_for(self):
+        async def stream_answer():
+            yield 1
+
+        with pytest.raises(TypeError) as excinfo:
+            argus.blindspot()(stream_answer)
+
+        message = str(excinfo.value)
+        assert "async with argus.blindspot():" in message
+        assert "async for item in stream_answer(...)" in message
+
+    def test_wrapping_the_consumption_site_is_the_documented_alternative(self):
+        def stream_answer():
+            yield suppressed()
+            yield suppressed()
+
+        with argus.blindspot():
+            collected = list(stream_answer())
+
+        # The generator body ran suppressed, and the scope closed cleanly.
+        assert collected == [True, True]
+        assert not suppressed()
+
+    def test_ordinary_and_async_functions_are_still_accepted(self):
+        @argus.blindspot()
+        def sync_work():
+            return suppressed()
+
+        @argus.blindspot()
+        async def async_work():
+            return suppressed()
+
+        assert sync_work() is True
+        assert asyncio.run(async_work()) is True
+
+
 class TestAsync:
     def test_async_context_manager_suppresses_across_await(self):
         async def scenario():

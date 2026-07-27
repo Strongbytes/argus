@@ -212,6 +212,46 @@ class TestFailureTagging:
         assert names[1].endswith(".error.readable.json")
 
 
+class TestRepeatEmit:
+    """A second emit rewrites each trace's files with the whole trace.
+
+    A flush is not terminal: a program can flush mid-run and keep producing
+    spans, which brings Argus back for another emit. This sink keeps its buffer
+    so the rewrite carries the complete trace, where the remote sink clears
+    its buffer instead (a re-POST would duplicate spans; a rewritten file just
+    supersedes the old one).
+    """
+
+    def test_later_spans_join_the_earlier_ones_in_the_same_files(
+        self, traces_dir
+    ):
+        exporter = FileSpanExporter(traces_dir, script_name="s")
+        exporter.export([make_span(trace_id=1, name="a")])
+        exporter.emit()
+
+        exporter.export([make_span(trace_id=1, name="b")])
+        exporter.emit()
+
+        # Still one pair of files, holding the whole trace rather than a
+        # fragment of it each.
+        assert len(_load_otlp(traces_dir)) == 1
+        (spans,) = _load_readable(traces_dir).values()
+        assert [span["name"] for span in spans] == ["a", "b"]
+
+    def test_emitting_again_with_nothing_new_keeps_the_files_intact(
+        self, traces_dir
+    ):
+        exporter = FileSpanExporter(traces_dir, script_name="s")
+        exporter.export([make_span(trace_id=1, name="a")])
+
+        exporter.emit()
+        exporter.emit()
+
+        assert len(_load_otlp(traces_dir)) == 1
+        (spans,) = _load_readable(traces_dir).values()
+        assert [span["name"] for span in spans] == ["a"]
+
+
 class TestMisc:
     def test_creates_base_dir_with_parents(self, tmp_path):
         nested = tmp_path / "deeply" / "nested" / "traces"

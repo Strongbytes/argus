@@ -26,22 +26,24 @@ def reset_argus_state():
 
     Without this, the first ``init`` would pin its configuration for the whole
     session and later tests would silently get the no-op re-init path.
+    ``reset`` does not flush, so tearing a test's session down never writes
+    trace files as a side effect.
     """
-    session_module._reset()
+    session_module.reset()
     yield
-    session_module._reset()
+    session_module.reset()
 
 
 @pytest.fixture(autouse=True)
 def no_dotenv(monkeypatch):
     """Stop ``init`` from reading the developer's real ``.env``.
 
-    ``init`` loads a ``.env`` found from the working directory, which in a
-    checkout is whatever the person running the suite happens to keep there.
-    Left alone it would leak into tests -- most sharply into the ones asserting
-    that ``init`` raises when no API key or endpoint is configured, which a
-    stray local value would quietly satisfy. Tests that care about environment
-    variables set them explicitly with ``monkeypatch``.
+    ``init`` loads the nearest ``.env`` at or above the working directory -- in
+    a checkout, whatever the person running the suite happens to keep there or
+    in a parent. Left alone it would leak into tests -- most sharply into the
+    ones asserting that ``init`` raises when no API key or endpoint is
+    configured, which a stray local value would quietly satisfy. Tests that care
+    about environment variables set them explicitly with ``monkeypatch``.
     """
     monkeypatch.setattr(session_module, "_load_dotenv", lambda: None)
 

@@ -14,8 +14,10 @@ OpenTelemetry hands spans to :meth:`~FileSpanExporter.export` as they end,
 incrementally and out of order, but at that moment we don't yet know how the
 run as a whole will turn out. So rather than streaming each span to disk, we
 accumulate them in memory, grouped by trace id, and defer the actual write to
-:meth:`~FileSpanExporter.emit`. Argus calls that method exactly once, on
-process exit, when the run's final outcome is known.
+:meth:`~FileSpanExporter.emit`. Argus calls that method on process exit, when
+the run's final outcome is known -- and again for any spans a program produces
+after flushing mid-run, which the buffer is deliberately kept for (see
+:meth:`~FileSpanExporter.emit`).
 
 Knowing the outcome up front is what lets the *filename* carry it: a healthy
 run lands at ``<timestamp>_<script>.<format>.json`` while a run that died on an
@@ -231,6 +233,16 @@ class FileSpanExporter(SpanExporter):
         captured (and obvious) rather than silently discarded. Spans within each
         trace are encoded in generation order (see :meth:`_in_generation_order`)
         so both files read top-to-bottom as the run unfolded.
+
+        The buffer is *not* cleared afterwards, so a repeat call rewrites each
+        trace's pair of files with everything buffered for it rather than
+        appending a fragment. That keeps every file a complete trace even when a
+        program flushes mid-run and keeps working (see
+        :meth:`argus.Session.flush`); the base name is allocated once per trace,
+        so the rewrite lands on the same two files instead of scattering partial
+        ones through the directory. The remote sink makes the opposite choice --
+        it clears on a confirmed send -- because re-POSTing spans duplicates
+        them at the backend, where rewriting a file simply supersedes it.
         """
         for trace_id, spans in self._trace_spans.items():
             base_name = self._base_name_for_trace(trace_id, failed)
