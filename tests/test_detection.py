@@ -1,4 +1,4 @@
-"""Tests for :mod:`argus.detection` -- selection, dedup, and auto-detection."""
+"""Tests for :mod:`argus.detection` -- the contract, selection, and detection."""
 
 from __future__ import annotations
 
@@ -6,13 +6,37 @@ import pytest
 
 from argus import detection
 
+from tests.factories import FakeInstrumentor
 
-class _FakeA:
+
+class _FakeA(FakeInstrumentor):
     pass
 
 
-class _FakeB:
+class _FakeB(FakeInstrumentor):
     pass
+
+
+class TestInstrumentorProtocol:
+    """``Instrumentor`` is what Argus requires: turn on, and turn back off."""
+
+    def test_what_detection_resolves_satisfies_it(self, monkeypatch):
+        monkeypatch.setattr(detection, "_entry_point_classes", lambda: [_FakeA])
+
+        (resolved,) = detection.resolve_instrumentors("all")
+
+        assert isinstance(resolved, detection.Instrumentor)
+
+    def test_an_object_with_neither_method_does_not(self):
+        assert not isinstance(object(), detection.Instrumentor)
+
+    def test_instrumenting_without_a_way_back_does_not(self):
+        # ``reset`` tears instrumentors down, so ``uninstrument`` is required.
+        class OneWay:
+            def instrument(self, **kwargs):
+                pass
+
+        assert not isinstance(OneWay(), detection.Instrumentor)
 
 
 class TestResolveInstrumentors:
@@ -64,7 +88,7 @@ class TestResolveInstrumentors:
         monkeypatch.setattr(
             detection,
             "_classes_for_keys",
-            lambda keys: [_FakeA, _FakeA, _FakeB],
+            lambda _keys: [_FakeA, _FakeA, _FakeB],
         )
 
         result = detection.resolve_instrumentors(["x"])
@@ -91,12 +115,12 @@ class TestAutoKeys:
         monkeypatch.setattr(
             detection, "_module_loaded", lambda name: name == "agents"
         )
-        monkeypatch.setattr(detection, "_module_available", lambda name: True)
+        monkeypatch.setattr(detection, "_module_available", lambda _name: True)
 
         assert detection._auto_keys() == ["openai_agents"]
 
     def test_falls_back_to_available_modules(self, monkeypatch):
-        monkeypatch.setattr(detection, "_module_loaded", lambda name: False)
+        monkeypatch.setattr(detection, "_module_loaded", lambda _name: False)
         monkeypatch.setattr(
             detection,
             "_module_available",

@@ -11,6 +11,10 @@ dependencies = [
     # encoding layer only -- not a network transport -- so the core stays light;
     # the ``otlp`` extra below adds the actual OTLP/HTTP exporter on top.
     "opentelemetry-exporter-otlp-proto-common>=1.30",
+    # Core rather than an extra: ``init`` reads the nearest ``.env`` so an API
+    # key can stay out of the caller's source, which is part of the documented
+    # one-line setup and not an opt-in convenience. See
+    # ``docs/design-notes.md`` ("Loading .env unconditionally").
     "python-dotenv>=1.0",
 ]
 
@@ -36,16 +40,19 @@ otlp = ["opentelemetry-exporter-otlp-proto-http>=1.30"]
 # with ``pip install -e . --group dev`` (pip 25.1+).
 #
 # Exact pins here, unlike the ranges above: this list configures one machine
-# rather than every installation, and a formatter that drifts a minor version
-# reformats files out from under the next contributor. The runtime dependencies
-# stay loose because a library must coexist with whatever its host resolved.
+# rather than every installation, and a tool that drifts a minor version
+# reformats files -- or reports findings nobody asked for -- out from under the
+# next contributor. The runtime dependencies stay loose because a library must
+# coexist with whatever its host resolved.
 [dependency-groups]
 dev = [
     "black==25.1.0",
     "commitizen==4.16.4",
     "isort==6.0.1",
+    "mypy==2.3.0",
     "pytest==9.0.2",
     "pytest-cov==7.1.0",
+    "ruff==0.16.0",
 ]
 
 [build-system]
@@ -54,6 +61,14 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# Argus is annotated throughout; the PEP 561 marker is what makes a consumer's
+# type checker read those annotations instead of treating every Argus symbol as
+# ``Any``. Package data has to be listed explicitly -- it is not picked up by
+# ``packages.find`` -- or the marker is left out of the wheel and the
+# annotations may as well not exist downstream.
+[tool.setuptools.package-data]
+argus = ["py.typed"]
 
 # Version bumps are derived from Conventional Commit messages, not chosen by
 # hand: run ``cz bump`` on demand and Commitizen scans the commits since the
@@ -78,6 +93,56 @@ line_length = 80
 # The test suite is a package imported as ``tests.*``; classify it as local so
 # its imports don't get grouped with third-party packages.
 known_local_folder = ["tests"]
+
+# Ruff lints only: black and isort already own layout and import order, and
+# running two formatters over one file is a fight, not a safety net.
+[tool.ruff]
+line-length = 80
+target-version = "py310"
+
+[tool.ruff.lint]
+# Pyflakes and pycodestyle for real mistakes, bugbear for the ones that look
+# deliberate, and flake8-unused-arguments for the dead parameter a refactor
+# leaves behind.
+select = ["E", "F", "W", "B", "ARG"]
+ignore = [
+    # Line length is black's call. Black leaves a long string literal, URL or
+    # comment alone rather than mangling it, so E501 would only ever nag about
+    # what the formatter deliberately kept.
+    "E501",
+    # Unused method arguments, which here are mandated from outside:
+    # OpenTelemetry fixes the signatures of ``export``, ``force_flush`` and
+    # ``_deliver``, the language fixes ``__exit__``'s, and a test double has to
+    # match whatever it stands in for. A sink with no work to bound still has to
+    # accept a timeout. ARG001 and ARG005 stay on, where an unused argument
+    # really is a leftover.
+    "ARG002",
+    "ARG003",
+]
+
+# The package ships a py.typed marker, so its annotations are a promise to
+# whoever installs it -- mypy is what keeps that promise honest.
+[tool.mypy]
+python_version = "3.10"
+files = ["src", "tests"]
+# Required in src, where an unannotated def would silently opt a public function
+# out of the checking consumers rely on. The overrides below let the test suite's
+# fixtures and stand-ins stay light.
+disallow_untyped_defs = true
+warn_redundant_casts = true
+no_implicit_optional = true
+# OpenTelemetry's SDK annotates most of its surface but not all of it, and
+# protobuf's json_format helpers ship none; an unstubbed import is not a finding
+# we can act on.
+ignore_missing_imports = true
+
+# The suite is written without annotations and leans on pytest's fixtures and
+# monkeypatching, which no type checker can follow far; its stand-ins are held to
+# Argus's protocols by ``isinstance`` assertions instead.
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+check_untyped_defs = false
 
 [tool.pytest.ini_options]
 # Put the project root on sys.path so the ``tests`` package (and its shared

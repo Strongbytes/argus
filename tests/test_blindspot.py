@@ -12,6 +12,7 @@ reads the flag, so the suppression is exercised the way production code sees it.
 from __future__ import annotations
 
 import asyncio
+import threading
 
 import pytest
 from opentelemetry.context import _SUPPRESS_INSTRUMENTATION_KEY, get_value
@@ -68,6 +69,43 @@ class TestContextManager:
             assert suppressed()
         assert not suppressed()
 
+    def test_sharing_one_instance_across_threads_is_balanced(self):
+        bs = argus.blindspot()
+        nested = threading.Event()
+        joined = threading.Event()
+        released = threading.Event()
+        outcomes = {}
+
+        def holder():
+            with bs:
+                with bs:
+                    nested.set()
+                    assert joined.wait(timeout=5)
+                # The other thread entered while this nesting was open, so an
+                # exit reaching for a token attached elsewhere would lift the
+                # suppression this outer scope still holds.
+                held = suppressed()
+            outcomes["holder"] = (held, suppressed())
+            released.set()
+
+        def joiner():
+            assert nested.wait(timeout=5)
+            with bs:
+                inside = suppressed()
+                joined.set()
+                assert released.wait(timeout=5)
+            outcomes["joiner"] = (inside, suppressed())
+
+        threads = [
+            threading.Thread(target=target) for target in (holder, joiner)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        assert outcomes == {"holder": (True, False), "joiner": (True, False)}
+
 
 class TestDecorator:
     def test_suppresses_for_the_duration_of_a_sync_call(self):
@@ -116,11 +154,10 @@ class TestDecorator:
 class TestGeneratorsAreRejected:
     """Decorating a generator function raises instead of failing silently.
 
-    A generator borrows its consumer's context, so a decorator cannot confine
-    suppression to the generator's body: hold it across a ``yield`` and it leaks
-    into the consumer, release it and the body runs unsuppressed. Both are
-    silent, and silence is unacceptable for a feature whose job is keeping
-    payloads off the record -- so this refuses at decoration time.
+    A generator borrows its consumer's context, which suppression cannot be
+    scoped to, so the decorator refuses at decoration time with a message naming
+    the pattern that does work. See ``docs/design-notes.md`` ("Why the decorator
+    refuses generators").
     """
 
     def test_sync_generator_function_raises(self):
@@ -221,6 +258,38 @@ class TestAsync:
             assert not suppressed()
 
         asyncio.run(scenario())
+
+    def test_sharing_one_instance_across_tasks_is_balanced(self):
+        bs = argus.blindspot()
+
+        async def scenario():
+            nested = asyncio.Event()
+            joined = asyncio.Event()
+            released = asyncio.Event()
+
+            async def holder():
+                async with bs:
+                    async with bs:
+                        nested.set()
+                        await joined.wait()
+                    # The other task entered while this nesting was open, so an
+                    # exit reaching for a token attached in that task's context
+                    # would lift the suppression this outer scope still holds.
+                    held = suppressed()
+                released.set()
+                return held, suppressed()
+
+            async def joiner():
+                await nested.wait()
+                async with bs:
+                    inside = suppressed()
+                    joined.set()
+                    await released.wait()
+                return inside, suppressed()
+
+            return await asyncio.gather(holder(), joiner())
+
+        assert asyncio.run(scenario()) == [(True, False), (True, False)]
 
     def test_suppression_propagates_into_tasks_spawned_inside(self):
         async def scenario():

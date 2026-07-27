@@ -1,33 +1,17 @@
 """The Argus front door: :func:`init` and the :class:`Session` it returns.
 
-Everything a user does with Argus flows through here. :func:`init` is the one
-call they make: it wires up an OpenTelemetry :class:`TracerProvider`, attaches
-the exporter(s), turns on the auto-detected instrumentor(s), and hands back a
-:class:`Session`. The :class:`Session` owns the run's tracing state and knows
-how to flush it.
+:func:`init` wires up an OpenTelemetry :class:`TracerProvider`, attaches the
+exporter(s), turns on the auto-detected instrumentor(s), and hands back a
+:class:`Session` that owns the run's tracing state and knows how to flush it.
+An ``atexit`` hook flushes that session on process exit and an ``excepthook``
+wrapper records whether the run crashed, so a single ``init`` line is enough to
+get a complete, correctly-labelled trace. :class:`Session` also doubles as a
+context manager for scoped flushing, and :func:`reset` retires the per-process
+singleton so a notebook or REPL can initialize again.
 
-The central design goal is **zero-ceremony capture**: a user should be able to
-add a single ``argus.init(...)`` line and get a complete, correctly-labelled
-trace on disk -- even if they never call anything else and even if their script
-crashes. Two module-level mechanisms make that possible:
-
-* An ``atexit`` hook (:func:`_flush_on_exit`) flushes the active session on
-  process exit, so the common case needs no context manager and no explicit
-  flush call.
-* An ``excepthook`` wrapper (:func:`_install_excepthook`) records whether the
-  run died from an unhandled exception. That flag is what lets the on-exit
-  flush tag a crashed run as failed without the user opting in.
-
-For callers who want deterministic, scoped flushing instead, :class:`Session`
-doubles as a context manager -- and because a flush with nothing new to emit is
-a no-op, using the context manager and the ``atexit`` hook together is
-harmless. A flush is not a point of no return, though: spans produced after one
-are emitted by the next, so code that keeps running past a ``with`` block still
-gets its trace.
-
-The session is a per-process singleton, which is what :func:`reset` is for: it
-retires the active one so a notebook, a REPL, or a test can initialize again
-with a different configuration instead of silently keeping the first.
+See ``docs/design-notes.md`` ("Zero-ceremony capture", "One session per
+process", "A flush is not terminal", "Exporters Argus does not own", "Opting out
+of the provider's atexit shutdown") for why it is built this way.
 """
 
 from __future__ import annotations
@@ -37,7 +21,8 @@ import os
 import sys
 import warnings
 from pathlib import Path
-from typing import Optional, Sequence, Tuple, Union
+from types import TracebackType
+from typing import List, Literal, Optional, Sequence, Tuple, Type, Union
 
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import (
@@ -48,31 +33,19 @@ from opentelemetry.sdk.trace import (
 )
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor, SpanExporter
 
-from .detection import resolve_instrumentors
+from .detection import Instrumentor, resolve_instrumentors
+from .exporters.base import BufferedSpanExporter
 from .exporters.file import FileSpanExporter
-from .exporters.otlp import make_otlp_exporter
-from .paths import default_traces_dir
+from .exporters.otlp import BufferedOTLPExporter, OtlpConfig
+from .paths import default_traces_dir, detect_script_name
 
-# OpenTelemetry caps span attributes at 128 by default. OpenInference flattens
-# every chat message into several attributes (role, content, each tool call's
-# id/name/arguments, ...), so a long agent conversation blows past 128 and the
-# SDK silently evicts the oldest attributes -- which, given the order
-# OpenInference writes them, includes the model's final output message. We raise
-# the ceiling far past any realistic run while keeping a rail against a
-# pathological one. At roughly three attributes per chat message this holds on
-# the order of ten-thousand messages in a single span.
-#
-# This is deliberately not exposed as an ``init`` argument: choosing it well
-# requires knowing OpenInference's per-message flattening, and a too-low value
-# fails silently (the oldest attributes, including the model's output, are
-# dropped with no error). The standard OpenTelemetry env vars remain the escape
-# hatch for the rare caller who must tune it.
+# OpenTelemetry caps span attributes at 128, low enough that a long agent
+# conversation silently loses the model's final output. Argus raises the ceiling
+# far past any realistic run, deliberately without an ``init`` argument, leaving
+# the standard OTel env vars as the escape hatch. See ``docs/design-notes.md``
+# ("The raised span-attribute ceiling").
 _DEFAULT_MAX_SPAN_ATTRIBUTES = 50_000
 _SPAN_ATTRIBUTE_COUNT_ENV_VAR = "OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT"
-# OpenTelemetry's generic attribute ceiling, which it uses as the *default* for
-# the span-specific limit above. Since Argus always passes an explicit span
-# attribute limit, that default never applies -- so this variable is read here
-# too, or a ceiling an operator deliberately set would be silently shadowed.
 _ATTRIBUTE_COUNT_ENV_VAR = "OTEL_ATTRIBUTE_COUNT_LIMIT"
 
 
@@ -81,15 +54,16 @@ def _attribute_cap_from_env(
 ) -> Tuple[bool, Optional[int]]:
     """Read an attribute-count ceiling from ``env_var``.
 
-    Returns a ``(found, cap)`` pair: ``found`` says whether the variable
-    supplied a usable value, and ``cap`` is the ceiling it asked for, where
-    ``None`` means "no limit". An unset or malformed value is reported as not
-    found, so the caller falls through to the next source.
+    Args:
+        env_var: Name of the environment variable to read.
+        empty_means_unlimited: How to read a variable set to nothing, mirroring
+            OpenTelemetry's own split between the two variables.
 
-    ``empty_means_unlimited`` mirrors OpenTelemetry's own split on a variable
-    set to nothing: for the span-specific limit an empty value *is* how "no
-    limit" is spelled, while an empty generic limit is indistinguishable from an
-    unset one (OpenTelemetry reads both as "use the default").
+    Returns:
+        A ``(found, cap)`` pair: ``found`` says whether the variable supplied a
+        usable value, and ``cap`` is the ceiling it asked for, where ``None``
+        means "no limit". An unset or malformed value is reported as not found,
+        so the caller falls through to the next source.
     """
     raw = os.environ.get(env_var)
     if raw is None:
@@ -111,14 +85,10 @@ def _resolve_span_limits() -> SpanLimits:
 
     The standard environment variables win, in OpenTelemetry's own precedence:
     ``OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT`` first, then the generic
-    ``OTEL_ATTRIBUTE_COUNT_LIMIT``. Argus's raised default applies only when
-    neither is usable. A malformed or negative span-specific value falls back
-    rather than raising; a malformed generic one is OpenTelemetry's to reject,
-    which :class:`SpanLimits` does when it reads that variable itself.
-
-    Only the span attribute *count* is touched. Every other limit -- events,
-    links, attribute lengths, and the generic ceiling's own effect on event and
-    link attributes -- keeps whatever OpenTelemetry resolves for it.
+    ``OTEL_ATTRIBUTE_COUNT_LIMIT``; Argus's raised default applies only when
+    neither is usable. Only the span attribute *count* is touched -- every other
+    limit keeps whatever OpenTelemetry resolves for it. See
+    ``docs/design-notes.md`` ("The raised span-attribute ceiling").
     """
     found, cap = _attribute_cap_from_env(
         _SPAN_ATTRIBUTE_COUNT_ENV_VAR, empty_means_unlimited=True
@@ -134,9 +104,7 @@ def _resolve_span_limits() -> SpanLimits:
     )
 
 
-# The single session for this process. Argus is intentionally a per-process
-# singleton: instrumentors are global, so a second provider can never reliably
-# receive spans for an already-instrumented framework. ``init`` enforces this.
+# The single session for this process; ``init`` enforces the singleton.
 _session: "Optional[Session]" = None
 # Flipped by our excepthook when the run dies with an unhandled exception, so
 # the atexit flush can tag the trace as a failure.
@@ -147,10 +115,9 @@ _excepthook_installed = False
 def _warn_reinit(existing: "Session", project: str) -> None:
     """Warn that Argus is already initialized and this call is being ignored.
 
-    Emitted as a :class:`RuntimeWarning` rather than raised so a stray second
-    ``init`` never crashes the host program -- the same forgiving stance
-    OpenTelemetry's own ``set_tracer_provider`` takes. Callers who *want* the
-    strict, fail-fast behavior can promote it with ``python -W error``.
+    Emitted as a :class:`RuntimeWarning` rather than raised, so a stray second
+    ``init`` never crashes the host program; ``python -W error`` promotes it for
+    callers who want it strict.
     """
     if project != existing.project:
         detail = (
@@ -175,7 +142,7 @@ def _warn_reinit(existing: "Session", project: str) -> None:
 def _install_excepthook() -> None:
     """Wrap ``sys.excepthook`` so we learn whether the run failed.
 
-    This is what lets the default ``atexit`` flush still distinguish success
+    Idempotent, and what lets the default ``atexit`` flush distinguish success
     from failure without forcing callers to use a context manager.
     """
     global _excepthook_installed
@@ -183,7 +150,11 @@ def _install_excepthook() -> None:
         return
     previous = sys.excepthook
 
-    def hook(exc_type, exc, tb):
+    def hook(
+        exc_type: Type[BaseException],
+        exc: BaseException,
+        tb: Optional[TracebackType],
+    ) -> None:
         global _run_failed
         _run_failed = True
         previous(exc_type, exc, tb)
@@ -192,54 +163,66 @@ def _install_excepthook() -> None:
     _excepthook_installed = True
 
 
-def _detect_script_name() -> str:
-    """Best-effort name for the running script, used to label trace files.
+def _resolve_otlp_config(
+    otlp: Union[bool, OtlpConfig, None],
+) -> Optional[OtlpConfig]:
+    """Normalize :func:`init`'s ``otlp`` argument to a config, or ``None`` for off.
 
-    Derived from the ``__main__`` module's filename (e.g. ``my_agent.py`` ->
-    ``my_agent``). Falls back to ``"session"`` when there is no file to read,
-    such as an interactive REPL or an embedded interpreter.
+    Args:
+        otlp: ``None``/``False`` to leave remote export off, ``True`` to enable it
+            with everything read from the environment, or an explicit
+            :class:`~argus.exporters.otlp.OtlpConfig`.
+
+    Raises:
+        TypeError: If ``otlp`` is anything else. A string -- the endpoint form
+            Argus took before the settings moved into ``OtlpConfig`` -- gets a
+            message naming its replacement.
     """
-    main = sys.modules.get("__main__")
-    path = getattr(main, "__file__", None)
-    return Path(path).stem if path else "session"
+    if otlp is None or otlp is False:
+        return None
+    if otlp is True:
+        return OtlpConfig()
+    if isinstance(otlp, OtlpConfig):
+        return otlp
+    if isinstance(otlp, str):
+        raise TypeError(
+            "argus.init() no longer takes an otlp endpoint string. Pass "
+            f"otlp=OtlpConfig({otlp!r}) instead -- it carries the endpoint, "
+            "api_key, headers and timeout together -- or otlp=True to read the "
+            "endpoint from the standard OTel environment variables."
+        )
+    raise TypeError(
+        "argus.init() takes otlp=True, otlp=OtlpConfig(...) or otlp=None; got "
+        f"{type(otlp).__name__}."
+    )
 
 
 def _load_dotenv() -> None:
     """Load the nearest ``.env`` at or above the working directory, if any.
 
     Run unconditionally by :func:`init`, which is what lets a key kept in
-    ``.env`` satisfy ``AEGIS_API_KEY`` with no argument passed. There is no
-    opt-out because there is nothing to opt out of: python-dotenv only ever
-    *fills in* variables (it leaves anything already in the environment
-    untouched, so a deployment's real configuration always wins), and a missing
-    file is a no-op. Quietly does nothing when ``python-dotenv`` isn't
-    installed, keeping the dependency genuinely optional.
+    ``.env`` satisfy ``AEGIS_API_KEY`` with no argument passed. Values already in
+    the environment are never overridden, and a missing file -- or a missing
+    ``python-dotenv`` -- is a no-op. See ``docs/design-notes.md`` ("Loading .env
+    unconditionally").
     """
     try:
         from dotenv import find_dotenv, load_dotenv
     except ModuleNotFoundError:
         return
     # usecwd=True walks up from the working directory (where the script runs)
-    # rather than from inside the installed argus package. The walk does mean a
-    # script in a monorepo can reach a .env in a shared parent; harmless given
-    # the no-override rule above, but it is why this is worth knowing about.
+    # rather than from inside the installed argus package.
     load_dotenv(find_dotenv(usecwd=True))
 
 
 class _SpanCounter(SpanProcessor):
     """Tallies ended spans so a :class:`Session` knows when it has new work.
 
-    :meth:`Session.flush` must be safe to call repeatedly -- the context
-    manager and the ``atexit`` hook routinely both fire -- but it must not
-    treat "already flushed once" as "finished forever", or spans produced after
-    an explicit flush would be buffered and never emitted. Comparing this tally
-    against the one recorded at the last flush distinguishes the two cases: an
-    unchanged count means there is genuinely nothing new to emit, while a higher
-    one means more spans arrived and deserve a second emit.
-
+    Comparing this tally against the one recorded at the last flush is what lets
+    :meth:`Session.flush` skip redundant work without going permanently inert.
     The sampling check mirrors :class:`SimpleSpanProcessor`, which drops
-    unsampled spans before they ever reach an exporter; counting them here would
-    otherwise signal new work that no exporter actually received.
+    unsampled spans before they reach an exporter. See ``docs/design-notes.md``
+    ("A flush is not terminal").
     """
 
     def __init__(self) -> None:
@@ -254,13 +237,9 @@ class _SpanCounter(SpanProcessor):
 def _force_flush(exporter: SpanExporter) -> None:
     """Drain a stock OpenTelemetry exporter, one that has no ``emit`` hook.
 
-    Argus's own exporters buffer everything and hand it over in a single
-    ``emit(failed=...)`` call, but ``exporters=`` accepts any
-    :class:`~opentelemetry.sdk.trace.export.SpanExporter`. Because Argus opts
-    out of the provider's own ``atexit`` shutdown (see :func:`init`), nothing
-    else in the pipeline would ever drain such an exporter, so one that batches
-    internally would silently lose the run. Failures are swallowed: a sink that
-    cannot flush must not take the host program down with it.
+    Failures are swallowed: a sink that cannot flush must not take the host
+    program down with it. See ``docs/design-notes.md`` ("Exporters Argus does not
+    own").
     """
     try:
         exporter.force_flush()
@@ -277,33 +256,47 @@ class Session:
 
         with argus.init("my_project_name"):
             run_my_agent()
+
+    Attributes:
+        provider: The :class:`TracerProvider` spans come from.
+        exporters: The sinks :meth:`flush` drives.
+        instrumentors: The live :class:`~argus.detection.Instrumentor` instances.
+        instruments: Their class names -- what ``init`` ended up patching.
+        project: Argus's logical run umbrella.
+
+    Those five are readable, for asserting or logging what ``init`` configured.
+    Argus drives them on flush, exit and :func:`reset`, so replacing or mutating
+    one is not supported.
     """
 
     def __init__(
         self,
         provider: TracerProvider,
         exporters: Sequence[SpanExporter],
-        instrumentors: Sequence[object],
+        instrumentors: Sequence[Instrumentor],
         project: str,
         span_counter: Optional[_SpanCounter] = None,
     ) -> None:
         """Store the run's tracing state.
 
-        Built by :func:`init`, not directly. Most arguments are what they say;
-        the two worth noting are ``exporters`` (the sinks :meth:`flush` drives
-        on exit) and ``instrumentors`` (the live instrumentor *instances*,
-        retained so the session can be torn down via :func:`reset`).
-        ``instruments`` exposes their class names for introspection.
+        Built by :func:`init`, not directly.
 
-        ``span_counter`` is the :class:`_SpanCounter` :func:`init` registered on
-        the provider; together with ``_flushed_at_count`` it lets :meth:`flush`
-        skip redundant work without going permanently inert (see
-        :meth:`flush`). It defaults to an unused counter so a hand-built session
-        still behaves, flushing on the first call and no-oping after.
+        Args:
+            provider: The configured :class:`TracerProvider` spans come from.
+            exporters: The sinks :meth:`flush` drives.
+            instrumentors: The live
+                :class:`~argus.detection.Instrumentor` instances, retained so
+                :func:`reset` can tear them down; ``instruments`` exposes their
+                class names for introspection.
+            project: Argus's logical run umbrella.
+            span_counter: The :class:`_SpanCounter` :func:`init` registered on
+                the provider, which lets :meth:`flush` tell "nothing new" from
+                "finished". Defaults to an unused counter, so a hand-built
+                session still flushes on the first call and no-ops after.
         """
         self.provider = provider
-        self.exporters = list(exporters)
-        self.instrumentors = list(instrumentors)
+        self.exporters: List[SpanExporter] = list(exporters)
+        self.instrumentors: List[Instrumentor] = list(instrumentors)
         self.instruments = [type(i).__name__ for i in self.instrumentors]
         self.project = project
         self._span_counter = span_counter or _SpanCounter()
@@ -313,21 +306,17 @@ class Session:
     def flush(self, *, failed: Optional[bool] = None) -> None:
         """Emit every exporter's buffered traces.
 
-        Argus's exporters buffer spans in memory and defer their real output
-        (a JSON file, an OTLP POST) to an ``emit(failed=...)`` hook that this
-        method drives. ``failed`` overrides the auto-detected outcome; when
-        omitted we use the process-wide flag set by our excepthook. Any other
-        :class:`~opentelemetry.sdk.trace.export.SpanExporter` passed via
-        ``exporters=`` has no such hook -- it received its spans synchronously
-        as they ended -- so it is drained with ``force_flush`` instead (see
-        :func:`_force_flush`).
+        Args:
+            failed: Overrides the auto-detected outcome; when omitted the
+                process-wide flag set by our excepthook is used.
 
-        Calling this repeatedly is safe *and* not permanently terminal. A
-        repeat call with no new spans since the last one returns immediately,
-        which is what makes the context manager and the ``atexit`` hook
-        harmless together. But if spans were produced *after* a flush -- code
-        that keeps running past a ``with argus.init(...)`` block -- the next
-        flush emits again rather than discarding them.
+        An exporter implementing
+        :class:`~argus.exporters.base.BufferedSpanExporter` is driven through
+        ``emit(failed=...)``; any other is drained with ``force_flush``. Calling
+        this repeatedly is safe and not terminal: a repeat call with no new spans
+        returns immediately, while spans produced *after* a flush are emitted by
+        the next one. See ``docs/design-notes.md`` ("A flush is not terminal",
+        "Exporters Argus does not own").
         """
         if self._flushed and self._span_counter.count == self._flushed_at_count:
             return
@@ -335,22 +324,19 @@ class Session:
         self._flushed_at_count = self._span_counter.count
         is_failed = _run_failed if failed is None else failed
         for exporter in self.exporters:
-            emit = getattr(exporter, "emit", None)
-            if callable(emit):
-                emit(failed=is_failed)
+            if isinstance(exporter, BufferedSpanExporter):
+                exporter.emit(failed=is_failed)
             else:
                 _force_flush(exporter)
 
     def _shutdown_exporters(self) -> None:
         """Release every exporter's resources, once the run is truly over.
 
-        Argus disables the provider's own ``atexit`` shutdown (see :func:`init`)
-        because it would tear exporters down *before* the final flush. That
-        leaves this: the last step of :func:`_flush_on_exit`, after everything
-        has been emitted, so sockets and file handles are still closed. Each
-        exporter is shut down independently and failures are swallowed, so one
-        misbehaving sink neither skips the others nor crashes interpreter
-        shutdown.
+        Driven only from :func:`_flush_on_exit`, after everything has been
+        emitted, and never from :meth:`flush` -- which must leave every exporter
+        usable for the spans still to come. Each exporter is shut down
+        independently and failures are swallowed, so one misbehaving sink neither
+        skips the others nor crashes interpreter shutdown.
         """
         for exporter in self.exporters:
             try:
@@ -362,11 +348,17 @@ class Session:
         """Enter the context manager, returning the session itself."""
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> bool:
+    def __exit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc: Optional[BaseException],
+        tb: Optional[TracebackType],
+    ) -> Literal[False]:
         """Flush on scope exit, tagging failure if the block raised.
 
-        Returns ``False`` so any exception from the ``with`` block propagates
-        normally rather than being swallowed.
+        Returns ``False`` -- typed as :data:`~typing.Literal` so a type checker
+        knows it is *always* false -- so any exception from the ``with`` block
+        propagates normally rather than being swallowed.
         """
         self.flush(failed=exc_type is not None)
         return False
@@ -379,8 +371,7 @@ def init(
     instrument: Union[str, Sequence[str], None] = None,
     output_dir: Union[str, Path, None] = None,
     exporters: Optional[Sequence[SpanExporter]] = None,
-    otlp: Union[bool, str, None] = None,
-    api_key: Optional[str] = None,
+    otlp: Union[bool, OtlpConfig, None] = None,
 ) -> Session:
     """Configure tracing and turn on the right instrumentor(s).
 
@@ -389,10 +380,8 @@ def init(
             ``argus.project``. A project may span several services.
         service: Identity of the observed application, stamped as the
             OpenTelemetry ``service.name``. Defaults to the running script's
-            name -- or ``"session"`` where there is no script file, as in a REPL
-            or an embedded interpreter (see :func:`_detect_script_name`) -- so
-            standard OTel backends group traces by the app that produced them
-            rather than by Argus.
+            name, or ``"session"`` where there is no script file (see
+            :func:`~argus.paths.detect_script_name`).
         instrument: ``None``/``"curated"`` for curated auto-detection
             (default), ``"all"`` for entry-point discovery, or a key / list of
             keys (e.g. ``"openai_agents"``, ``["agno"]``).
@@ -405,54 +394,48 @@ def init(
             canonical OTLP/JSON and a human-readable rendering. Any
             :class:`~opentelemetry.sdk.trace.export.SpanExporter` is accepted:
             spans reach it synchronously as they end, and Argus drains it with
-            ``force_flush`` on flush and ``shutdown`` at exit. An exporter that
-            instead defines ``emit(failed=...)`` -- as both of Argus's own do --
-            opts into the buffer-now/emit-once lifecycle and is handed the run's
-            outcome (see :meth:`Session.flush`).
-        otlp: Enable remote OTLP/HTTP export *alongside* the other exporters.
-            The spans are buffered and POSTed once on exit (same lifecycle as
-            the on-disk exporter), not streamed mid-run. A string sets the full
-            endpoint URL explicitly; ``True`` reads it from the standard
-            ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` or
-            ``OTEL_EXPORTER_OTLP_ENDPOINT`` env var, raising
-            :class:`ValueError` when neither is set -- Argus ships no default
-            endpoint (see :func:`~argus.exporters.otlp._resolve_endpoint`).
-            ``None`` (the default) and ``False`` leave OTLP off; a blank string
-            raises rather than joining them, since it reads as an endpoint that
-            failed to resolve. For extra headers, a timeout, or full control,
-            build the exporter with
-            :func:`~argus.exporters.otlp.make_otlp_exporter` and pass it in
-            ``exporters`` instead.
-        api_key: Key authenticating the OTLP export, sent as
-            ``Authorization: Bearer <key>``. Falls back to the ``AEGIS_API_KEY``
-            env var (which is the recommended way to supply it -- an explicit
-            argument invites committing a live secret), and is required whenever
-            ``otlp`` is on. Applies only to the exporter ``otlp`` builds; a
-            hand-built exporter takes its own ``api_key``.
+            ``force_flush`` on flush and ``shutdown`` at exit. One that
+            implements :class:`~argus.exporters.base.BufferedSpanExporter` --
+            as both of Argus's own do -- opts into the buffer-now/emit-once
+            lifecycle and is handed the run's outcome (see
+            :meth:`Session.flush`).
+        otlp: Enable remote OTLP/HTTP export *alongside* the other exporters,
+            buffered and POSTed once on exit. ``True`` takes the endpoint and API
+            key from the environment; an
+            :class:`~argus.exporters.otlp.OtlpConfig` sets any of the endpoint,
+            key, extra headers and timeout explicitly. ``None`` (the default) and
+            ``False`` leave remote export off. Every remote setting lives in that
+            config, so nothing here can be passed without an endpoint to use it
+            (see ``docs/design-notes.md``, "Remote export is one argument").
 
     Returns:
         A :class:`Session`; traces flush automatically on process exit.
 
     Raises:
-        ValueError: If ``otlp`` is a blank string, or is on with no endpoint or
+        TypeError: If ``otlp`` is neither a bool, an
+            :class:`~argus.exporters.otlp.OtlpConfig`, nor ``None``.
+        ValueError: If ``instrument`` names a key the curated registry does not
+            know (see :func:`~argus.detection.resolve_instrumentors`), or if
+            remote export is on with a blank or unresolvable endpoint, or with
             no API key resolvable.
+        ImportError: If remote export is on but the optional ``otlp`` extra is
+            not installed. Like the endpoint and key, this surfaces here rather
+            than at exit with the run's whole trace already buffered (see
+            ``docs/design-notes.md``, "No default OTLP endpoint").
 
     The nearest ``.env`` at or above the working directory is loaded before
-    anything is resolved, so a key or endpoint kept there is picked up without
-    being passed (see :func:`_load_dotenv`).
-
-    Calling ``init`` more than once in a process is a no-op: it warns and
-    returns the already-active :class:`Session` unchanged. Because
-    instrumentors are global singletons a second provider could not reliably
-    capture spans anyway, so to trace several frameworks pass them all in one
-    call (e.g. ``instrument=["openai_agents", "claude"]``). To genuinely
-    reconfigure -- re-running a notebook cell, say -- retire the first session
-    with :func:`reset` and call ``init`` again.
+    anything is resolved (see :func:`_load_dotenv`). Calling ``init`` more than
+    once in a process warns and returns the already-active :class:`Session`
+    unchanged; call :func:`reset` first to genuinely reconfigure. See
+    ``docs/design-notes.md`` ("One session per process").
     """
     global _session
     if _session is not None:
         _warn_reinit(_session, project)
         return _session
+
+    # Checked before anything is created, so a bad argument costs no side effects.
+    otlp_config = _resolve_otlp_config(otlp)
 
     _load_dotenv()
 
@@ -467,22 +450,16 @@ def init(
 
     resource = Resource.create(
         {
-            "service.name": service or _detect_script_name(),
+            "service.name": service or detect_script_name(),
             "argus.project": project,
             "argus.version": argus_version,
         }
     )
-    # shutdown_on_exit=False is load-bearing, not a tidiness choice. A
-    # TracerProvider otherwise registers its own atexit handler in its
-    # constructor, and atexit runs handlers LIFO. Argus's _flush_on_exit is
-    # registered at *import* time -- before any provider exists -- so the
-    # provider's shutdown, registered here at init time, would run *first* on
-    # exit. That shutdown cascades into each exporter's shutdown(), tearing down
-    # the OTLP transport's HTTP session, so Argus's later flush would then call
-    # emit() on an already-dead transport (OTel logs "Exporter already shutdown,
-    # ignoring batch" and returns FAILURE -- the backend is never even
-    # contacted). Argus drives the whole buffer-now/emit-once lifecycle itself
-    # via _flush_on_exit, so we opt out of the provider's competing handler.
+    # shutdown_on_exit=False is load-bearing: the provider's own atexit handler
+    # would otherwise run before Argus's flush (atexit is LIFO) and tear the
+    # exporters down before they emit. Argus drives the lifecycle itself and
+    # closes them in _flush_on_exit. See ``docs/design-notes.md`` ("Opting out
+    # of the provider's atexit shutdown").
     provider = TracerProvider(
         resource=resource,
         span_limits=_resolve_span_limits(),
@@ -493,12 +470,11 @@ def init(
     span_counter = _SpanCounter()
     provider.add_span_processor(span_counter)
 
+    sinks: List[SpanExporter]
     if exporters is None:
-        exporters = [
-            FileSpanExporter(base_dir, script_name=_detect_script_name())
-        ]
+        sinks = [FileSpanExporter(base_dir)]
     else:
-        exporters = list(exporters)
+        sinks = list(exporters)
         if output_dir is not None:
             # output_dir only ever configured the default file exporter, which
             # an explicit list replaces. Applying it is impossible (the given
@@ -510,47 +486,26 @@ def init(
                 "where the default file exporter writes, and exporters "
                 "replaces that exporter. Pass the directory to the exporter "
                 "itself instead, e.g. "
-                "exporters=[FileSpanExporter(output_dir, script_name='run')].",
+                "exporters=[FileSpanExporter(output_dir)].",
                 RuntimeWarning,
                 stacklevel=2,
             )
-    # A string endpoint says "export remotely, here", so a blank one says
-    # nothing at all -- and it is what os.getenv("ENDPOINT", "") yields when the
-    # variable is missing. An empty string is falsy, so it would quietly turn
-    # export off, leaving the api_key branch below to blame an endpoint the
-    # caller believes they passed; a whitespace-only one is truthy and would
-    # sail through to the transport as a nonsense URL. Name the real problem.
-    if isinstance(otlp, str) and not otlp.strip():
-        raise ValueError(
-            "argus.init() was given an empty otlp endpoint. Pass otlp=None (or "
-            "omit it) to leave remote export off, otlp=True to read the "
-            "endpoint from the standard OTel environment variables, or a "
-            "complete URL to set it here."
+    # The remote sink layers on top of whatever the exporter list already holds,
+    # so the on-disk JSON and the remote backend run side by side.
+    if otlp_config is not None:
+        sinks.append(
+            BufferedOTLPExporter(
+                otlp_config.endpoint,
+                api_key=otlp_config.api_key,
+                headers=otlp_config.headers,
+                timeout=otlp_config.timeout,
+            )
         )
-    # ``otlp`` layers a remote sink on top of whatever the exporter list already
-    # holds, so the on-disk JSON and the remote backend can run side by side. A
-    # string is the endpoint; True defers to the OTEL_EXPORTER_OTLP_TRACES_
-    # ENDPOINT env var (and errors if that is unset).
-    if otlp:
-        endpoint = otlp.strip() if isinstance(otlp, str) else None
-        exporters.append(make_otlp_exporter(endpoint, api_key=api_key))
-    elif api_key is not None:
-        # A key with no remote sink to authenticate does nothing. Silence here
-        # would read as "the key was accepted", so name the missing half.
-        warnings.warn(
-            "argus.init() was given an api_key but no otlp endpoint, so the "
-            "key is unused and nothing is exported remotely. Pass otlp=True "
-            "(or otlp='https://your-backend/...') to enable remote export.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-    # Every Argus exporter buffers spans and emits on exit, so SimpleSpanProcessor
-    # (synchronous, no background queue that could drop under load) suits them
-    # all; the actual send/write is deferred to each exporter's ``emit`` hook. A
-    # caller's own exporter has no such hook, and this processor is why that
-    # still works: it hands spans over as they end, so nothing is stranded in a
-    # queue Argus doesn't own.
-    for exporter in exporters:
+    # SimpleSpanProcessor is synchronous, with no background queue that could
+    # drop spans under load, and it hands spans to an exporter that has no
+    # ``emit`` hook as they end, so nothing is stranded in a queue Argus doesn't
+    # own.
+    for exporter in sinks:
         provider.add_span_processor(SimpleSpanProcessor(exporter))
 
     instances = resolve_instrumentors(instrument)
@@ -559,7 +514,7 @@ def init(
 
     session = Session(
         provider=provider,
-        exporters=exporters,
+        exporters=sinks,
         instrumentors=instances,
         project=project,
         span_counter=span_counter,
@@ -573,37 +528,32 @@ def reset() -> None:
     """Retire the active session so the next :func:`init` takes effect.
 
     Argus is a per-process singleton, so a second :func:`init` warns and returns
-    the first session unchanged. That is the right default for a script, but it
-    also pins the first configuration in place for the life of the process --
-    which is wrong in a notebook or REPL, where re-running the cell that calls
-    ``init`` is the ordinary way to change a setting. Calling this first makes
-    the next ``init`` a real initialization again::
+    the first session unchanged. Calling this first makes the next ``init`` a
+    real initialization again, which is what a notebook or REPL needs::
 
         argus.reset()
         argus.init("my_project_name", otlp=True)
 
-    Uninstruments the live instrumentors (so the next ``init`` can re-wire them
-    to its own provider), drops the session, and clears the failure flag. The
-    excepthook wrapper is left installed; it is idempotent and harmless to keep.
-
-    It deliberately does *not* flush: retiring a session and emitting its traces
-    are separate decisions. But the ``atexit`` hook only ever flushes the
-    *active* session, so whatever the dropped one had buffered is gone. Flush
-    first when you still want it::
+    Uninstruments the live instrumentors, drops the session, and clears the
+    failure flag; the idempotent excepthook wrapper is left installed. It
+    deliberately does *not* flush, and the ``atexit`` hook only flushes the
+    *active* session, so flush first when you still want what the retired one
+    buffered::
 
         session.flush()
         argus.reset()
+
+    See ``docs/design-notes.md`` ("One session per process").
     """
     global _session, _run_failed
     if _session is not None:
         for instrumentor in _session.instrumentors:
-            uninstrument = getattr(instrumentor, "uninstrument", None)
-            if callable(uninstrument):
-                try:
-                    uninstrument()
-                except Exception:
-                    # A failed teardown must not block the reset.
-                    pass
+            try:
+                instrumentor.uninstrument()
+            except Exception:
+                # A failed teardown -- or an object that turned out not to have
+                # the method at all -- must not block the reset.
+                pass
     _session = None
     _run_failed = False
 
@@ -612,14 +562,10 @@ def reset() -> None:
 def _flush_on_exit() -> None:
     """Flush the active session on process exit, then close its exporters.
 
-    Registered with ``atexit`` so traces are persisted without the caller
-    lifting a finger. Exceptions are swallowed: a failure to write the trace
-    must never crash interpreter shutdown.
-
-    The shutdown runs even if the flush failed -- resources are released either
-    way -- and only here, never from :meth:`Session.flush`, because the run is
-    genuinely over at this point. Flushing from a context manager mid-program
-    must leave every exporter usable for the spans still to come.
+    Exceptions are swallowed: a failure to write the trace must never crash
+    interpreter shutdown. The shutdown runs even if the flush failed --
+    resources are released either way -- and only here, because the run is
+    genuinely over at this point.
     """
     if _session is None:
         return

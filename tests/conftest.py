@@ -13,11 +13,7 @@ import pytest
 
 from argus import session as session_module
 
-from tests.factories import (
-    RecordingExporter,
-    make_instrumentor,
-    patch_resolve_instrumentors,
-)
+from tests.factories import RecordingExporter, patch_resolve_instrumentors
 
 
 @pytest.fixture(autouse=True)
@@ -52,12 +48,6 @@ def no_dotenv(monkeypatch):
 def traces_dir(tmp_path):
     """A temporary directory to write traces into."""
     return tmp_path / "traces"
-
-
-@pytest.fixture
-def instrumentor():
-    """A single fresh fake instrumentor."""
-    return make_instrumentor()
 
 
 @pytest.fixture

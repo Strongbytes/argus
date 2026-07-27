@@ -1,15 +1,13 @@
 """Decide which OpenInference instrumentor(s) to turn on.
 
-Two strategies are supported:
+Two strategies are supported: a curated registry mapping each agent framework to
+the instrumentor(s) it needs, detected by whether the framework is in use
+(default), and entry-point discovery of every registered instrumentor (opt-in via
+``instrument="all"``). See ``docs/design-notes.md`` ("Curated detection over
+entry points").
 
-* **Curated registry (default).** A small table maps an agent framework to the
-  instrumentor(s) it needs, detected by whether the framework is actually in
-  use. This is predictable and avoids double-instrumenting (e.g. it won't add
-  the standalone OpenAI instrumentor on top of the OpenAI Agents one).
-* **Entry-point discovery (opt-in via ``instrument="all"``).** Loads every
-  instrumentor registered under the ``openinference_instrumentor`` entry-point
-  group. New instrumentors light up with no code change, at the cost of
-  possibly instrumenting more than intended in a multi-framework environment.
+:class:`Instrumentor` is the contract everything here resolves to, and the one
+Argus drives: the extension point for a framework it doesn't know about yet.
 """
 
 from __future__ import annotations
@@ -18,11 +16,50 @@ import sys
 from dataclasses import dataclass
 from importlib import import_module
 from importlib.util import find_spec
-from typing import Iterable, Sequence, Union
+from typing import (
+    Any,
+    Iterable,
+    Optional,
+    Protocol,
+    Sequence,
+    Union,
+    runtime_checkable,
+)
 
-# Keys for the bundled openinference instrumentation packages, matched against
-# their published ``openinference_instrumentor`` entry-point names.
+from opentelemetry.trace import TracerProvider
+
+# The entry-point group OpenInference instrumentors publish themselves under.
+# It backs ``instrument="all"`` alone, which loads every instrumentor registered
+# in the group without consulting a key; the curated registry below is a
+# separate route that never reads it.
 ENTRY_POINT_GROUP = "openinference_instrumentor"
+
+
+@runtime_checkable
+class Instrumentor(Protocol):
+    """Something that can patch a framework to emit spans, and unpatch it again.
+
+    OpenInference's instrumentors all derive from OpenTelemetry's
+    ``BaseInstrumentor``, whose surface is far wider than this. These two methods
+    are the whole of what Argus calls, and therefore the whole of what a
+    substitute has to provide -- a fake in the test suite, or an instrumentor for
+    a framework the curated registry doesn't cover yet. The protocol is
+    structural: nothing has to inherit from it, or even know it exists. See
+    ``docs/design-notes.md`` ("Extension points are protocols").
+    """
+
+    def instrument(
+        self,
+        *,
+        tracer_provider: Optional[TracerProvider] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Patch the target framework to emit spans into ``tracer_provider``."""
+        ...
+
+    def uninstrument(self, **kwargs: Any) -> None:
+        """Undo :meth:`instrument`, leaving the framework unpatched."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -38,8 +75,10 @@ class _Framework:
     instrumentors: tuple[str, ...]
 
 
-# Order matters: higher-level agent frameworks take precedence over the bare
-# OpenAI client so we don't instrument the same calls twice.
+# Registry order is the order frameworks are detected, and so the order their
+# instrumentors are applied. It is not what keeps OpenAI calls from being
+# instrumented twice -- _OPENAI_SUPERSEDERS below does that, and reordering
+# these entries would not change it.
 _FRAMEWORKS: tuple[_Framework, ...] = (
     _Framework(
         "openai_agents",
@@ -71,17 +110,23 @@ _FRAMEWORKS: tuple[_Framework, ...] = (
 )
 _BY_KEY = {fw.key: fw for fw in _FRAMEWORKS}
 
-# Frameworks that already cover OpenAI calls, so the standalone OpenAI
-# instrumentor should be dropped from auto-detection when one is present.
+# Frameworks that make the standalone ``openai`` key redundant, so
+# auto-detection drops it when one of them is present -- for two different
+# reasons. The OpenAI Agents instrumentor covers those calls itself, so adding
+# the standalone one on top really would instrument them twice. Agno's does not
+# cover them, which is why its entry above already pairs AgnoInstrumentor with
+# OpenAIInstrumentor: there the dropped key resolves to a class the selection
+# holds either way, and ``resolve_instrumentors`` dedupes by class, so its
+# membership here shapes the detected keys rather than the outcome.
 _OPENAI_SUPERSEDERS = {"openai_agents", "agno"}
 
 
-def _load(path: str):
+def _load(path: str) -> Any:
     """Import and return the attribute named by a ``"module:attr"`` path.
 
-    This is the lazy-import seam: instrumentor classes are only imported when a
-    framework is actually selected, so an unused optional dependency never has
-    to be importable.
+    The lazy-import seam: an instrumentor class is imported only once its
+    framework is selected, so an unused optional dependency never has to be
+    importable.
     """
     module_path, _, attr = path.partition(":")
     return getattr(import_module(module_path), attr)
@@ -90,8 +135,7 @@ def _load(path: str):
 def _module_loaded(name: str) -> bool:
     """Return whether ``name`` has already been imported in this process.
 
-    A cheap ``sys.modules`` membership check -- it never triggers an import,
-    so it reflects what the current script chose to bring in.
+    A ``sys.modules`` membership check, so it never triggers an import.
     """
     return name in sys.modules
 
@@ -111,9 +155,9 @@ def _module_available(name: str) -> bool:
 def _auto_keys() -> list[str]:
     """Detect frameworks in use, preferring what's already imported.
 
-    Using ``sys.modules`` first means that in a shared environment with several
-    SDKs installed we instrument only the framework the current script actually
-    imported, rather than everything that happens to be installed.
+    Falls back to importability when nothing relevant is loaded yet, and drops
+    the standalone OpenAI key when a framework that supersedes it is present.
+    See ``docs/design-notes.md`` ("Curated detection over entry points").
     """
     candidates = [fw.key for fw in _FRAMEWORKS if _module_loaded(fw.detector)]
     if not candidates:
@@ -125,16 +169,15 @@ def _auto_keys() -> list[str]:
     return candidates
 
 
-def _entry_point_classes() -> list[type]:
+def _entry_point_classes() -> list[type[Instrumentor]]:
     """Load every instrumentor advertised under the entry-point group.
 
-    Backs ``instrument="all"``: any package that registers itself lights up
-    with no code change here. A broken or incompatible instrumentor is skipped
+    Backs ``instrument="all"``. A broken or incompatible instrumentor is skipped
     rather than allowed to abort the run.
     """
     from importlib.metadata import entry_points
 
-    classes: list[type] = []
+    classes: list[type[Instrumentor]] = []
     for entry_point in entry_points(group=ENTRY_POINT_GROUP):
         try:
             classes.append(entry_point.load())
@@ -144,14 +187,14 @@ def _entry_point_classes() -> list[type]:
     return classes
 
 
-def _classes_for_keys(keys: Iterable[str]) -> list[type]:
+def _classes_for_keys(keys: Iterable[str]) -> list[type[Instrumentor]]:
     """Resolve curated registry keys to their instrumentor classes.
 
     Raises:
         ValueError: If a key isn't in the curated registry, with the set of
             known keys to guide the fix.
     """
-    classes: list[type] = []
+    classes: list[type[Instrumentor]] = []
     for key in keys:
         framework = _BY_KEY.get(key)
         if framework is None:
@@ -166,7 +209,7 @@ def _classes_for_keys(keys: Iterable[str]) -> list[type]:
 
 def resolve_instrumentors(
     instrument: Union[str, Sequence[str], None],
-) -> list:
+) -> list[Instrumentor]:
     """Return instantiated instrumentors for the requested selection.
 
     * ``None`` / ``"curated"``  -> curated auto-detection (default)
@@ -176,6 +219,12 @@ def resolve_instrumentors(
 
     ``None`` is accepted as a synonym for ``"curated"`` so the bare
     ``init(project)`` does the auto-detection.
+
+    Raises:
+        ValueError: If an explicitly requested key is not in the curated
+            registry. The message lists the known keys, since a typo is the
+            likely cause. Auto-detection cannot hit this: it selects the keys
+            itself.
     """
     if instrument == "all":
         classes = _entry_point_classes()
@@ -186,8 +235,8 @@ def resolve_instrumentors(
     else:
         classes = _classes_for_keys(instrument)
 
-    instances = []
-    seen: set[type] = set()
+    instances: list[Instrumentor] = []
+    seen: set[type[Instrumentor]] = set()
     for cls in classes:
         if cls in seen:
             continue

@@ -36,6 +36,23 @@ ends in an unhandled exception is still captured, tagged with an `.error` marker
 before the format suffix (`..._<script>.error.otlp.json` and
 `..._<script>.error.readable.json`).
 
+The scheme in full -- including the numeric tiebreaker a trace gets when a
+sibling trace from the same run landed in the same second -- is one function,
+`argus.exporters.trace_filename`, if you need to reproduce or parse a name
+rather than read one. The tiebreaker is scoped to a single run: two processes
+writing to the same directory in the same second, under the same script name,
+can still overwrite each other's files.
+
+## Documentation
+
+Three places, each with one job:
+
+| Where                                          | What's in it                                                                                     |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| This README                                    | The reference guide: every argument, default, and environment variable, with what each one means. |
+| [docs/examples.md](docs/examples.md)            | A cookbook of complete, task-shaped examples -- per framework, per exporter, blindspots, notebooks, custom sinks. Start here if you'd rather read code than prose. |
+| [docs/design-notes.md](docs/design-notes.md)    | The design decisions and their rationale: why spans are buffered until exit, why there is no default OTLP endpoint, why the blindspot decorator refuses generators, and the rest. |
+
 ## Installation
 
 The package is named `argus-trace` and imported as `argus`. Install it with
@@ -49,8 +66,21 @@ pip install "argus-trace[openai]"          # OpenAI client, used directly
 pip install "argus-trace[otlp]"            # remote OTLP/HTTP export
 ```
 
-The bare `pip install argus-trace` pulls only the thin core (OpenTelemetry +
-`python-dotenv`); instrumentors are optional so Argus stays lightweight.
+The bare `pip install argus-trace` pulls only the thin core, which is three
+packages:
+
+| Package                                    | Why it's core                                                                                    |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------ |
+| `opentelemetry-sdk`                        | The tracing pipeline Argus configures -- provider, span processors, exporters.                    |
+| `opentelemetry-exporter-otlp-proto-common` | The OTLP protobuf span encoder (and, transitively, `protobuf`), which the default file sink needs to write canonical OTLP/JSON. This is the encoding layer only, not a network transport. |
+| `python-dotenv`                            | Reads the nearest `.env` on `init`, which is what lets an API key stay out of your source (see [Authentication](#authentication)). |
+
+Nothing else comes with it: the instrumentors and the network transport are
+extras, which is what keeps the core light.
+
+Argus is annotated throughout and ships a PEP 561 `py.typed` marker, so your type
+checker reads those annotations straight out of the installed package -- no stub
+package, no `Any` where an `OtlpConfig` or a `Session` should be.
 
 The `[otlp]` extra installs the OpenTelemetry OTLP/HTTP exporter package that
 backs the built-in remote export (see [Remote export over OTLP](#remote-export-over-otlp)).
@@ -58,7 +88,8 @@ backs the built-in remote export (see [Remote export over OTLP](#remote-export-o
 ## Local development
 
 To work on Argus itself, install from a checkout in editable mode together with
-the `dev` dependency group -- black, isort, pytest, pytest-cov, and commitizen:
+the `dev` dependency group -- black, isort, ruff, mypy, pytest, pytest-cov, and
+commitizen:
 
 ```bash
 pip install -e . --group dev
@@ -71,6 +102,24 @@ runtime, extras, and dev.
 
 Add the relevant `[…]` extra from above if you want to exercise a particular
 instrumentor locally, e.g. `pip install -e ".[otlp]" --group dev`.
+
+### Formatting, linting, and type checking
+
+Four tools, each with a single job, all configured in `pyproject.toml` so none of
+them needs flags:
+
+```bash
+black src tests      # formatting (80 columns)
+isort src tests      # import order
+ruff check src tests # lint: unused imports and arguments, likely bugs
+mypy                 # type check src (strictly) and tests (lightly)
+```
+
+`black` and `isort` take `--check` if you want them to report rather than
+rewrite. Ruff is a linter here only -- its formatter is deliberately not used, so
+there is one formatter to answer to. Since the package ships a `py.typed` marker,
+its annotations are part of its contract: every function in `src/` is annotated
+and `mypy` enforces that.
 
 ### Running the tests
 
@@ -106,11 +155,14 @@ pytest --cov --cov-report=html     # also write an htmlcov/ report to browse
 | ------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
 | `project`     | (required)           | Argus's logical run umbrella; stamped onto every span as `argus.project`. May span several services.                                 |
 | `service`     | script name          | Observed app identity; stamped as OpenTelemetry `service.name`. Defaults to the running script's name, or `session` where there is no script file (a REPL, an embedded interpreter). |
-| `instrument`  | `None`               | `None`/`"curated"` = curated auto-detection; `"all"` = entry-point discovery; a key or list of keys (`"openai_agents"`, `["agno"]`). |
+| `instrument`  | `None`               | `None`/`"curated"` = curated auto-detection; `"all"` = entry-point discovery; a key or list of keys (`"openai_agents"`, `["agno"]`). An unknown key raises `ValueError` listing the known ones. |
 | `output_dir`  | `<cwd>/traces`       | Directory the default file exporter writes to. Configures that exporter only, so it has no effect (and warns) alongside `exporters`.  |
 | `exporters`   | `[FileSpanExporter]` | Replace the default sink with your own OpenTelemetry exporters. See [Custom exporters](#custom-exporters).                            |
-| `otlp`        | `None`               | Enable remote OTLP/HTTP export alongside the others. `True` reads the endpoint from the standard OTel env vars (raises if unset -- no default); a string sets the endpoint URL. See below. |
-| `api_key`     | `AEGIS_API_KEY`      | Key authenticating the OTLP export, sent as `Authorization: Bearer <key>`. Required whenever `otlp` is on; defaults to the `AEGIS_API_KEY` env var. See below. |
+| `otlp`        | `None`               | Enable remote OTLP/HTTP export alongside the others. `True` takes the endpoint and key from the environment; an `OtlpConfig(...)` sets them (plus headers and timeout) explicitly. See below. |
+
+`project` and `service` land on every span as resource attributes, alongside a
+third Argus stamps itself: `argus.version`, the version of Argus that recorded
+the trace, so a trace file read later says which release produced it.
 
 `init` returns a `Session` that flushes automatically via `atexit`. It can also
 be used as a context manager for deterministic, scoped flushing:
@@ -149,6 +201,32 @@ session.flush()    # the Session that init returned
 argus.reset()
 ```
 
+### The span attribute ceiling
+
+OpenTelemetry caps a span at **128 attributes** and silently evicts the oldest
+ones beyond that. OpenInference spends several attributes on every chat message
+(role, content, each tool call's id, name and arguments), so a long agent
+conversation crosses 128 mid-run -- and what gets evicted includes the model's
+final output message. `init` therefore raises the ceiling to **50,000**: far past
+any realistic run, while keeping a rail against a pathological one.
+
+It is deliberately not an `init` argument, since choosing the value well means
+knowing how OpenInference flattens messages and a too-low value fails silently.
+The standard OpenTelemetry variables are the escape hatch for the rare case that
+needs one, in OpenTelemetry's own precedence:
+
+| Variable                          | Read as                                                                                                                    |
+| --------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT` | The span attribute ceiling. Set it to nothing at all for **no limit**.                                                      |
+| `OTEL_ATTRIBUTE_COUNT_LIMIT`      | The all-signals fallback, consulted only when the span-specific variable gives nothing usable. Set to nothing at all it is indistinguishable from unset, so it is ignored rather than read as "no limit". |
+
+Argus's 50,000 applies only when neither variable gives a usable value, and
+anything that is not a non-negative integer counts as unusable and falls through
+to the next source. Only the attribute _count_ is raised: the limits on events,
+links, and attribute value lengths keep whatever OpenTelemetry resolves for them.
+Why the generic variable is honored at all -- and why this isn't an argument --
+is in [the design notes](docs/design-notes.md#the-raised-span-attribute-ceiling).
+
 ## Remote export over OTLP
 
 Besides the on-disk JSON, Argus can send spans to a backend over standard
@@ -168,9 +246,26 @@ import argus
 # default endpoint, and ingest is authenticated):
 argus.init("my_project_name", otlp=True)
 
-# Or point it at your own ingest route explicitly:
-argus.init("my_project_name", otlp="http://localhost:9000/api/v1/trace/ingest")
+# Or configure it explicitly. OtlpConfig carries every remote setting:
+argus.init(
+    "my_project_name",
+    otlp=argus.OtlpConfig("http://localhost:9000/api/v1/trace/ingest"),
+)
 ```
+
+`otlp` is the only remote-export argument, and `OtlpConfig` holds all four
+settings, so there is no way to pass a key, a header or a timeout with no
+endpoint to use it:
+
+| Field      | Default                | Notes                                                                     |
+| ---------- | ---------------------- | ------------------------------------------------------------------------- |
+| `endpoint` | the OTel env vars      | Complete POST URL, used verbatim. See the resolution order below.         |
+| `api_key`  | `AEGIS_API_KEY`        | Sent as `Authorization: Bearer <key>`. Required. See [Authentication](#authentication). |
+| `headers`  | none                   | Extra HTTP headers sent alongside the credential (tenant or routing hints). |
+| `timeout`  | the transport's own    | Per-export timeout in seconds; otherwise `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` applies. |
+
+A bare `OtlpConfig()` therefore means the same thing as `otlp=True`. Pass `None`,
+or omit `otlp`, to keep remote export off.
 
 Argus ships **no default endpoint**: it's a library anyone can install, so
 rather than guess a target (and risk quietly shipping traces to the wrong
@@ -179,7 +274,7 @@ precedence, first match winning:
 
 | Source                                | Treated as                                        |
 | ------------------------------------- | ------------------------------------------------- |
-| `otlp="https://..."` argument         | the complete POST URL, used verbatim              |
+| `OtlpConfig(endpoint="https://...")`  | the complete POST URL, used verbatim              |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`  | the complete POST URL, used verbatim              |
 | `OTEL_EXPORTER_OTLP_ENDPOINT`         | a base for all signals, with `v1/traces` appended |
 
@@ -188,19 +283,18 @@ ordinary OpenTelemetry way, and Argus will POST to
 `http://localhost:4318/v1/traces`. The first two sources get no path appended --
 they are already the full route. Where OpenTelemetry would fall back to
 `http://localhost:4318` with nothing set at all, Argus raises `ValueError`
-instead. Timeouts come from the usual `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` var.
+instead.
 
-An `otlp=""` raises as well, rather than being read as "off". A blank string is
-what `os.getenv("MY_ENDPOINT", "")` hands you when the variable is missing, and
-treating it as falsy would disable export over what is almost always a
-configuration slip. Pass `None`, or omit `otlp`, when you do mean to keep remote
-export off.
+A blank endpoint -- `OtlpConfig("")`, which is what `os.getenv("MY_ENDPOINT", "")`
+hands you when the variable is missing -- raises rather than falling back to the
+environment, since it reads as an endpoint that failed to resolve rather than as
+a request to look elsewhere. Surrounding whitespace is stripped, so a URL with a
+trailing newline still works.
 
 The headers variables -- `OTEL_EXPORTER_OTLP_TRACES_HEADERS` and
 `OTEL_EXPORTER_OTLP_HEADERS` -- **never take effect**. They apply only when no
 headers are passed to the exporter in code, and Argus always passes them, since
-that is how the API key below travels. Add extra headers through
-`make_otlp_exporter(..., headers={...})` instead.
+that is how the API key below travels. Use `OtlpConfig(headers={...})` instead.
 
 ### Authentication
 
@@ -223,7 +317,7 @@ argus.init("my_project_name", otlp=True)   # key read from AEGIS_API_KEY
 Pass it explicitly when it comes from somewhere else, like a secrets manager:
 
 ```python
-argus.init("my_project_name", otlp=True, api_key=fetch_secret("aegis"))
+argus.init("my_project_name", otlp=argus.OtlpConfig(api_key=fetch_secret("aegis")))
 ```
 
 The key is **required** whenever `otlp` is on, and it is resolved and checked
@@ -243,49 +337,46 @@ each span's own status rather than in a filename. Spans the backend has accepted
 are dropped from the buffer, so a program that flushes mid-run and keeps going
 sends only the new spans in its next request, never a duplicate.
 
-For full control (extra headers, timeout, compression, a shared HTTP session),
-build the exporter yourself and pass it via `exporters=`. Authentication still
-comes from `api_key`/`AEGIS_API_KEY` -- an `Authorization` entry in `headers`
-is rejected rather than silently overwritten:
+A customized remote sink stays a one-argument decision, because `OtlpConfig`
+carries the headers and timeout too -- and it still runs alongside the trace
+files. Authentication comes from `api_key`/`AEGIS_API_KEY` either way; an
+`Authorization` entry in `headers` is rejected rather than silently overwritten:
 
 ```python
-from argus.exporters import make_otlp_exporter
+from argus import OtlpConfig
+
+argus.init(
+    "my_project_name",
+    otlp=OtlpConfig(
+        "http://localhost:9000/api/v1/trace/ingest",
+        api_key="sk_…",              # or leave it to AEGIS_API_KEY
+        headers={"x-tenant": "acme"},
+        timeout=10,
+    ),
+)
+```
+
+For anything beyond those four settings -- compression, a shared HTTP session --
+construct the exporter yourself and pass it through `exporters=`. It is named
+`BufferedOTLPExporter` rather than `OTLPSpanExporter` so it doesn't shadow
+OpenTelemetry's streaming exporter of that name. Since `exporters=` replaces the
+default sink, name the file one too when you want both:
+
+```python
+from argus import FileSpanExporter
+from argus.exporters import BufferedOTLPExporter
 
 argus.init(
     "my_project_name",
     exporters=[
-        make_otlp_exporter(
+        FileSpanExporter(),
+        BufferedOTLPExporter(
             "http://localhost:9000/api/v1/trace/ingest",
-            api_key="sk_…",       # or leave it to AEGIS_API_KEY
             timeout=10,
         ),
     ],
 )
 ```
-
-Note that passing `exporters=` replaces the default file exporter, so a
-hand-built OTLP exporter means naming the file one too when you want both. Only
-a *customized* remote sink needs this -- plain `otlp=True` already runs alongside
-the files:
-
-```python
-from argus.exporters import FileSpanExporter, make_otlp_exporter
-
-argus.init(
-    "my_project_name",
-    exporters=[
-        FileSpanExporter("./traces", script_name="my_agent"),
-        make_otlp_exporter(
-            "http://localhost:9000/api/v1/trace/ingest",
-            timeout=10,
-        ),
-    ],
-)
-```
-
-`FileSpanExporter`'s two arguments are the values `init` would otherwise derive:
-the directory to write into (`<cwd>/traces`, or whatever `output_dir` said) and
-the name stamped into each filename (the running script's).
 
 ## Custom exporters
 
@@ -302,11 +393,12 @@ from opentelemetry.sdk.trace.export import ConsoleSpanExporter
 argus.init("my_project_name", exporters=[ConsoleSpanExporter()])
 ```
 
-An exporter that also defines `emit(failed: bool)` opts into the buffer-now,
-write-once lifecycle that Argus's own two sinks use. Argus then calls `emit`
-instead of `force_flush`, passing whether the run ended in an unhandled
-exception -- which is what lets the file exporter tag a failed run in its
-filename. Buffer in `export`, do the real work in `emit`:
+An exporter that also defines `emit(failed: bool)` satisfies Argus's
+`BufferedSpanExporter` protocol and opts into the buffer-now, write-once
+lifecycle its own two sinks use. Argus then calls `emit` instead of
+`force_flush`, passing whether the run ended in an unhandled exception -- which
+is what lets the file exporter tag a failed run in its filename. Buffer in
+`export`, do the real work in `emit`:
 
 ```python
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
@@ -331,6 +423,18 @@ class SummaryExporter(SpanExporter):
         pass
 ```
 
+`BufferedSpanExporter` is a runtime-checkable `typing.Protocol`, so the class
+above needs no inheritance to be recognized -- Argus discovers it with
+`isinstance`. Import it when you want a type checker to hold your sink to the
+contract:
+
+```python
+from argus.exporters import BufferedSpanExporter
+
+def build_sink() -> BufferedSpanExporter:
+    return SummaryExporter()
+```
+
 `emit` can be called more than once: a scoped flush emits what has accumulated,
 and spans produced afterwards are emitted by the next flush. So decide what a
 repeat call should do — Argus's own two sinks answer that differently, each way
@@ -340,20 +444,22 @@ clears its buffer once the backend confirms the batch, so no span is POSTed
 twice. The example above follows the OTLP shape, reporting only what is new.
 
 Because `exporters=` replaces the default sink, `output_dir` no longer applies
-(Argus warns if you pass both). To keep files while adding a sink of your own,
-construct the file exporter yourself:
+(Argus warns if you pass both). To keep the trace files while adding a sink of
+your own, name the file exporter alongside it -- with no arguments it is exactly
+the sink `init` would have built, writing to `<cwd>/traces` under the running
+script's name:
 
 ```python
-from argus.exporters import FileSpanExporter
+from argus import FileSpanExporter
 
 argus.init(
     "my_project_name",
-    exporters=[
-        FileSpanExporter("./my_traces", script_name="my_agent"),
-        SummaryExporter(),
-    ],
+    exporters=[FileSpanExporter(), SummaryExporter()],
 )
 ```
+
+Both of its arguments override what `init` would derive, for the cases where you
+want something else: `FileSpanExporter("./my_traces", script_name="my_agent")`.
 
 ## Excluding code from tracing (`argus.blindspot`)
 
@@ -421,6 +527,12 @@ use (preferring already-imported modules) and avoiding double-instrumentation:
 
 Pass `instrument="all"` to instead load every instrumentor registered under
 the `openinference_instrumentor` entry-point group.
+
+Whichever route they arrive by, what Argus needs from an instrumentor is two
+methods -- `instrument(tracer_provider=...)` and `uninstrument()` -- expressed as
+the runtime-checkable `argus.detection.Instrumentor` protocol. OpenInference's
+instrumentors satisfy it by way of OpenTelemetry's `BaseInstrumentor`, and so
+does anything of your own that defines the two, with nothing to inherit from.
 
 ## Roadmap
 

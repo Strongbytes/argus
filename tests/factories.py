@@ -5,10 +5,12 @@ exporters do real I/O, so the suite never touches either. Instead these
 factories build lightweight stand-ins that mimic exactly the surface Argus
 relies on:
 
-* :class:`FakeInstrumentor` (built by :func:`make_instrumentor`) -- the slice of
-  the OpenTelemetry ``BaseInstrumentor`` API that :func:`argus.init` and
+* :class:`FakeInstrumentor` (built by :func:`make_instrumentor`) -- an
+  :class:`~argus.detection.Instrumentor`, which is to say the slice of the
+  OpenTelemetry ``BaseInstrumentor`` API that :func:`argus.init` and
   :func:`argus.reset` call (``instrument`` / ``uninstrument``), with call
-  recording.
+  recording. It satisfies the protocol without inheriting from anything, which is
+  the point of the protocol.
 * :class:`RaisingUninstrumentor` -- the same fake with a failing
   ``uninstrument``, so a test can assert that :func:`argus.reset` tears the
   session down anyway rather than propagating a sink's teardown error.
@@ -40,19 +42,15 @@ from opentelemetry.trace import SpanContext, SpanKind, TraceFlags
 class FakeInstrumentor:
     """Stand-in for an OpenInference/OpenTelemetry ``BaseInstrumentor``.
 
-    Records the ``tracer_provider`` passed to each ``instrument`` call and how
-    often ``uninstrument`` ran, so tests can assert that Argus wires a
-    framework exactly once and tears it down on reset.
+    Satisfies :class:`~argus.detection.Instrumentor` structurally, and records the
+    ``tracer_provider`` passed to each ``instrument`` call and how often
+    ``uninstrument`` ran, so tests can assert that Argus wires a framework exactly
+    once and tears it down on reset.
     """
 
-    def __init__(self, name: str = "FakeInstrumentor") -> None:
-        self.name = name
+    def __init__(self) -> None:
         self.instrument_calls: List[Any] = []
         self.uninstrument_count = 0
-
-    @property
-    def instrumented(self) -> bool:
-        return len(self.instrument_calls) > self.uninstrument_count
 
     def instrument(self, *, tracer_provider: Any = None, **_: Any) -> None:
         self.instrument_calls.append(tracer_provider)
@@ -61,9 +59,9 @@ class FakeInstrumentor:
         self.uninstrument_count += 1
 
 
-def make_instrumentor(name: str = "FakeInstrumentor") -> FakeInstrumentor:
+def make_instrumentor() -> FakeInstrumentor:
     """Return a fresh :class:`FakeInstrumentor`."""
-    return FakeInstrumentor(name=name)
+    return FakeInstrumentor()
 
 
 class RaisingUninstrumentor(FakeInstrumentor):
@@ -77,15 +75,14 @@ class RaisingUninstrumentor(FakeInstrumentor):
 class RecordingExporter(SpanExporter):
     """A real ``SpanExporter`` that records exports and emit flushes.
 
-    Implements the ``emit(failed=...)`` hook that
-    :meth:`argus.Session.flush` looks for, so tests can assert the failure flag
-    propagates without writing any files or hitting the network.
+    Satisfies :class:`~argus.exporters.base.BufferedSpanExporter`, so
+    :meth:`argus.Session.flush` drives it through ``emit`` and tests can assert
+    the failure flag propagates without writing files or hitting the network.
     """
 
     def __init__(self) -> None:
         self.exported_spans: List[Any] = []
         self.emit_calls: List[bool] = []
-        self.shutdown_count = 0
 
     def export(self, spans: Sequence[Any]) -> SpanExportResult:
         self.exported_spans.extend(spans)
@@ -96,9 +93,6 @@ class RecordingExporter(SpanExporter):
 
     def force_flush(self, timeout_millis: int = 30_000) -> bool:
         return True
-
-    def shutdown(self) -> None:
-        self.shutdown_count += 1
 
 
 class PlainSpanExporter(SpanExporter):

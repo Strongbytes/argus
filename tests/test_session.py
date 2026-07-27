@@ -23,7 +23,7 @@ class _BufferedExporter(PlainSpanExporter):
 
     def __init__(self) -> None:
         super().__init__()
-        self.emit_calls = []
+        self.emit_calls: list[bool] = []
 
     def emit(self, failed: bool = False) -> None:
         self.emit_calls.append(failed)
@@ -69,6 +69,9 @@ class TestInit:
         # OTLP transport before Argus's flush emits -- so emit() would hit an
         # already-dead transport and the backend would never be contacted.
         # Argus owns the lifecycle, so the provider must register no handler.
+        # There is no public way to ask, so this reads a private OTel attribute
+        # deliberately: if an SDK upgrade renames it, this test failing is the
+        # cheapest possible warning that the wiring needs rechecking.
         use_instrumentors()
         session = argus.init("proj", exporters=[recording_exporter])
 
@@ -190,6 +193,10 @@ class TestSpanLimits:
 
         session = argus.init("proj", exporters=[recording_exporter])
 
+        # A private OTel attribute on purpose: it pins the exact ceiling the
+        # provider was built with, which the behavioral test below cannot (that
+        # one only proves the ceiling is somewhere above 200). Should an SDK
+        # upgrade rename it, this failing is the warning to recheck the wiring.
         assert session.provider._span_limits.max_span_attributes == self.DEFAULT
 
     def test_provider_retains_attributes_past_otel_default(
@@ -213,11 +220,9 @@ class TestSpanLimits:
 class TestPlainExporterLifecycle:
     """``exporters=`` accepts any OpenTelemetry exporter, not just Argus's own.
 
-    An exporter without an ``emit`` hook never opted into the buffer-now/
-    emit-once lifecycle, and because Argus disables the provider's ``atexit``
-    shutdown nothing else would ever drain it. So Argus drives it the ordinary
-    way instead: spans as they end, ``force_flush`` on flush, ``shutdown`` at
-    exit.
+    One without an ``emit`` hook is driven the ordinary way: spans reach it as
+    they end, ``force_flush`` on every flush, ``shutdown`` once at exit. See
+    ``docs/design-notes.md`` ("Exporters Argus does not own").
     """
 
     def test_spans_reach_it_as_they_end(self, use_instrumentors):

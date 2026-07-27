@@ -1,25 +1,9 @@
 """The Argus escape hatch: :class:`blindspot`, a region the watcher ignores.
 
-Argus's default stance is to record everything an instrumented run does. That
-is the right default, but not every step deserves a trace -- a workflow may
-touch secrets, PII, or simply noise you never want on disk. :class:`blindspot`
-carves out a scope where Argus looks away.
-
-The mechanism is OpenTelemetry's own suppression flag. Entering a blindspot
-attaches :data:`~opentelemetry.context._SUPPRESS_INSTRUMENTATION_KEY` to the
-active context; OpenInference's instrumentors (and OTel-aware libraries in
-general) check that flag and skip span creation entirely while it is set.
-Nothing is created, buffered, or written -- this suppresses at the source
-rather than dropping spans after the fact, so sensitive payloads never enter
-the pipeline at all.
-
-Because the flag rides on a :mod:`contextvars`-backed context, the suppression
-follows ``await`` points and copies into tasks spawned inside the block. It does
-*not* reach threads you start yourself (a raw :class:`threading.Thread` or a
-:class:`~concurrent.futures.ThreadPoolExecutor`), since those begin from a fresh
-context unless you explicitly copy it.
-
-The same object works three ways::
+Argus records everything by default. When a workflow -- or a slice of one --
+should stay off the record, :class:`blindspot` carves out a scope where no spans
+are created at all, by attaching OpenTelemetry's own suppression flag to the
+active context. The same object works three ways::
 
     with argus.blindspot():            # synchronous block
         run_sensitive_step()
@@ -31,21 +15,27 @@ The same object works three ways::
     def internal_workflow(...):
         ...
 
-The decorator covers ordinary and ``async def`` functions. It refuses generator
-and async-generator functions with a :class:`TypeError`, because a generator
-borrows its consumer's context and suppression therefore cannot be confined to
-its body -- wrap the loop that consumes it instead (see
+The suppression follows ``await`` points and tasks spawned inside the block, but
+not threads the caller starts. The decorator covers ordinary and ``async def``
+functions and refuses generators with a :class:`TypeError` (see
 :func:`_reject_generator`).
+
+See ``docs/design-notes.md`` ("Suppression at the source", "Why the decorator
+refuses generators").
 """
 
 from __future__ import annotations
 
 import functools
 import inspect
-from typing import Any, Callable, List, Optional, TypeVar
+from contextvars import ContextVar
+from types import TracebackType
+from typing import Any, Callable, Literal, Optional, Tuple, Type, TypeVar
 
 from opentelemetry.context import (
     _SUPPRESS_INSTRUMENTATION_KEY,
+    Context,
+    Token,
     attach,
     detach,
     set_value,
@@ -53,23 +43,24 @@ from opentelemetry.context import (
 
 F = TypeVar("F", bound=Callable[..., Any])
 
+# The tokens for the blindspot scopes currently open, innermost last. A
+# ``ContextVar`` rather than instance state so the stack is per thread and per
+# task, like the suppression it undoes: a token can only be detached from the
+# context it was attached in, so an instance shared across threads or tasks must
+# not let one of them pop another's token.
+_open_tokens: ContextVar[Tuple[Token[Context], ...]] = ContextVar(
+    "argus_blindspot_tokens", default=()
+)
+
 
 def _reject_generator(func: Callable[..., Any]) -> None:
     """Refuse to decorate a generator function, explaining what to do instead.
 
-    A generator does not get a context of its own the way a coroutine does: it
-    runs in whatever context its consumer is in. So a wrapper holding the
-    suppression across a ``yield`` cannot confine it to the generator's body --
-    the flag stays attached while the consumer runs too, quietly suppressing
-    code the caller never meant to hide. Nor can the wrapper simply not hold it,
-    because the body would then run unsuppressed, which is worse: the decorator
-    would look like it was protecting a sensitive stream while doing nothing.
-
-    Both failure modes are silent, and for a feature whose whole job is keeping
-    payloads off the record, silence is the one thing we cannot ship. So we
-    refuse at decoration time -- when the mistake is cheap to fix -- and name the
-    pattern that does work: wrap the *consumption* of the generator, which
-    covers the body and the consumer alike, deliberately.
+    A generator runs in its consumer's context, so suppression can be neither
+    confined to its body nor safely dropped -- both failures being silent, which
+    a privacy primitive cannot ship. The error names the pattern that does work:
+    wrap the *consumption* of the generator. See ``docs/design-notes.md`` ("Why
+    the decorator refuses generators").
 
     Raises:
         TypeError: If ``func`` is a generator or async-generator function.
@@ -99,42 +90,41 @@ def _reject_generator(func: Callable[..., Any]) -> None:
 class blindspot:
     """A scope Argus does not trace -- usable as context manager or decorator.
 
-    Suppression is keyed to the context active when the scope is entered, so a
-    single instance can be entered more than once (and nested) safely: each
-    entry stacks its own token and exit pops it in last-in/first-out order.
-    Used as a decorator the suppression is established per call, so concurrent
-    or recursive invocations never interfere.
+    A single instance can be entered repeatedly and nested safely -- including
+    from several threads or tasks at once, since the tokens that undo the
+    suppression live in :data:`_open_tokens` rather than on the instance -- and
+    the decorator establishes suppression per call, so recursive or concurrent
+    invocations never interfere.
     """
-
-    def __init__(self) -> None:
-        """Create an (initially inactive) blindspot.
-
-        The token stack is what makes re-entry and nesting safe; it holds one
-        OpenTelemetry context token per active ``with``/``async with`` entry.
-        """
-        self._tokens: List[object] = []
 
     def _enter(self) -> "blindspot":
         """Attach the suppression flag and remember the token to undo it."""
-        self._tokens.append(
-            attach(set_value(_SUPPRESS_INSTRUMENTATION_KEY, True))
-        )
+        token = attach(set_value(_SUPPRESS_INSTRUMENTATION_KEY, True))
+        _open_tokens.set(_open_tokens.get() + (token,))
         return self
 
     def _exit(self) -> None:
         """Detach the most recent suppression token, restoring the context."""
-        if self._tokens:
-            detach(self._tokens.pop())
+        open_tokens = _open_tokens.get()
+        if open_tokens:
+            _open_tokens.set(open_tokens[:-1])
+            detach(open_tokens[-1])
 
     def __enter__(self) -> "blindspot":
         """Begin a synchronous blindspot."""
         return self._enter()
 
-    def __exit__(self, exc_type, exc, tb) -> bool:
+    def __exit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc: Optional[BaseException],
+        tb: Optional[TracebackType],
+    ) -> Literal[False]:
         """End the blindspot, restoring tracing even if the block raised.
 
-        Returns ``False`` so any exception from the block propagates normally
-        rather than being swallowed.
+        Returns ``False`` -- typed as :data:`~typing.Literal` so a type checker
+        knows it is *always* false -- so any exception from the block propagates
+        normally rather than being swallowed.
         """
         self._exit()
         return False
@@ -143,7 +133,12 @@ class blindspot:
         """Begin an asynchronous blindspot (``async with``)."""
         return self._enter()
 
-    async def __aexit__(self, exc_type, exc, tb) -> bool:
+    async def __aexit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc: Optional[BaseException],
+        tb: Optional[TracebackType],
+    ) -> Literal[False]:
         """End an asynchronous blindspot, restoring tracing on exit."""
         self._exit()
         return False
@@ -152,15 +147,12 @@ class blindspot:
         """Wrap ``func`` so each call runs inside its own blindspot.
 
         Coroutine functions are wrapped so the suppression spans the awaited
-        body; plain functions get a synchronous wrapper. A fresh
-        :class:`blindspot` is used per invocation so the decorator is safe under
-        recursion and concurrency.
+        body; plain functions get a synchronous wrapper.
 
         Raises:
-            TypeError: If ``func`` is a generator or async-generator function.
-                Suppression cannot be scoped to a generator's body (see
-                :func:`_reject_generator`), so rather than decorate one
-                misleadingly we refuse and point at the pattern that works.
+            TypeError: If ``func`` is a generator or async-generator function,
+                whose body suppression cannot be scoped to (see
+                :func:`_reject_generator`).
         """
         _reject_generator(func)
         if inspect.iscoroutinefunction(func):

@@ -1,104 +1,118 @@
 """A span exporter that persists OpenTelemetry traces to disk in two shapes.
 
-This is Argus's default sink: the thing that turns the spans an instrumented
-run emits into files you can open, diff, and triage later. For every trace it
-writes *two* files that share a base name and differ only by a format marker:
+This is Argus's default sink. For every trace it writes *two* files that share a
+base name and differ only by a format marker:
 
-* ``<timestamp>_<script>.otlp.json`` -- canonical OTLP/JSON, the exact shape
-  the wire protocol uses, so it can be replayed to any OTLP backend.
-* ``<timestamp>_<script>.readable.json`` -- a human-readable rendering meant
-  for eyeballing: a plain list of spans with embedded JSON payloads unescaped.
+* ``<timestamp>_<script>.otlp.json`` -- canonical OTLP/JSON, the exact shape the
+  wire protocol uses, so it can be replayed to any OTLP backend.
+* ``<timestamp>_<script>.readable.json`` -- a human-readable rendering: a plain
+  list of spans with embedded JSON payloads unescaped.
 
-The design hinges on one deliberate choice -- **buffer now, write once**.
-OpenTelemetry hands spans to :meth:`~FileSpanExporter.export` as they end,
-incrementally and out of order, but at that moment we don't yet know how the
-run as a whole will turn out. So rather than streaming each span to disk, we
-accumulate them in memory, grouped by trace id, and defer the actual write to
-:meth:`~FileSpanExporter.emit`. Argus calls that method on process exit, when
-the run's final outcome is known -- and again for any spans a program produces
-after flushing mid-run, which the buffer is deliberately kept for (see
-:meth:`~FileSpanExporter.emit`).
+Spans are buffered as they end and written when :meth:`FileSpanExporter.emit`
+runs, which is what lets the filename carry the run's outcome.
+:func:`trace_filename` owns the naming scheme in full.
 
-Knowing the outcome up front is what lets the *filename* carry it: a healthy
-run lands at ``<timestamp>_<script>.<format>.json`` while a run that died on an
-unhandled exception is tagged ``<timestamp>_<script>.error.<format>.json``. The
-timestamp is a UTC ``YYYY-MM-DD_HH-MM-SS`` stamp; the date-first layout also
-means a directory listing sorts chronologically. Failed runs are therefore
-obvious at a glance in a directory listing and never silently discarded. Each
-distinct trace gets its own pair of files, and a collision guard keeps two
-traces from the same second from clobbering one another.
-
-The OTLP file's *contents* are canonical OTLP/JSON: it is a single
-``ExportTraceServiceRequest`` -- the same protobuf message
-:class:`~argus.exporters.otlp.OTLPSpanExporter` POSTs to a backend -- rendered
-to JSON via :func:`google.protobuf.json_format.MessageToDict`. We reuse
-OpenTelemetry's own :func:`~opentelemetry.exporter.otlp.proto.common\
-.trace_encoder.encode_spans` rather than hand-rolling the schema, so the file
-sink and the remote sink can never drift apart. One conformance detail we
-handle explicitly: OTLP/JSON's single documented departure from the proto3 JSON
-mapping is that ``traceId``/``spanId`` (and ``parentSpanId``, including the ids
-nested under span links) are **hex** strings, not the base64 that
-:func:`~google.protobuf.json_format.MessageToDict` emits by default -- so we
-re-encode just those fields to hex (see :func:`_hex_encode_ids`). That makes the
-file drop-in valid for POSTing straight back as OTLP/JSON, the common replay
-path. The rarer path -- rebuilding the protobuf message from this file to send
-as OTLP/protobuf -- must therefore hex-decode those id fields rather than lean
-on stock proto3 JSON parsing (which would base64-decode them). Every other field
-follows the standard camelCase OTLP layout. Encoding relies on the
-``opentelemetry-exporter-otlp-proto-common`` package, a core dependency because
-this is the default sink -- it is the encoder only, not a network transport.
-
-The readable file trades wire fidelity for legibility. Each span is rendered
-with OpenTelemetry's own :meth:`~opentelemetry.sdk.trace.ReadableSpan.to_json`
-(snake_case fields, hex ids, ISO timestamps) and then passed through
-:func:`~argus.json_utils.expand_embedded_json`, which recursively parses any
-attribute value that is itself a JSON string back into structured data -- so a
-model's ``output.value`` shows up as a real object instead of an escaped blob.
-The file is a plain JSON array of those spans, in generation order.
-
-The remaining methods (:meth:`~FileSpanExporter.force_flush` and
-:meth:`~FileSpanExporter.shutdown`) exist only to satisfy the
-:class:`~opentelemetry.sdk.trace.export.SpanExporter` contract; because all the
-real work is deferred to ``emit`` they are intentionally no-ops.
+See ``docs/design-notes.md`` ("Buffer now, emit once", "Two files per trace",
+"Trace filenames", "Hex ids in OTLP/JSON", "Generation order") for the reasoning
+behind all of that.
 """
 
 from __future__ import annotations
 
 import base64
 import json
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, List, Sequence
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from google.protobuf.json_format import MessageToDict
 from opentelemetry.exporter.otlp.proto.common.trace_encoder import encode_spans
 from opentelemetry.sdk.trace import ReadableSpan
-from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 
 from ..json_utils import expand_embedded_json
+from ..paths import default_traces_dir, detect_script_name
+from .base import _BufferedExporter
 
-# Format markers appended (before ``.json``) to a trace's shared base name, so
-# each file self-describes its shape: canonical OTLP/JSON vs. the human-readable
-# rendering. Kept as a suffix (not a prefix) so the date-first base name still
-# sorts a directory listing chronologically.
-_OTLP_SUFFIX = ".otlp.json"
-_READABLE_SUFFIX = ".readable.json"
+#: Which of a trace's two files is meant; also the file's own format marker.
+TraceFormat = Literal["otlp", "readable"]
 
 # The OTLP/JSON id fields (``bytes`` in protobuf) that must be hex, not the
 # base64 the proto3 JSON mapping -- and thus ``MessageToDict`` -- defaults to.
-# ``parentSpanId`` and the ids nested inside span links share the same rule.
 _ID_JSON_KEYS = frozenset({"traceId", "spanId", "parentSpanId"})
+
+
+def trace_filename(
+    script_name: str,
+    trace_format: TraceFormat,
+    *,
+    failed: bool = False,
+    timestamp: Optional[datetime] = None,
+    sequence: int = 0,
+) -> str:
+    """Return the file name a trace is written under.
+
+    The whole scheme lives here, in one place to read, test, and point at::
+
+        <YYYY-MM-DD_HH-MM-SS>_<script>[.error][_<sequence>].<format>.json
+
+    Args:
+        script_name: Identifies the run that produced the trace.
+        trace_format: ``"otlp"`` for canonical OTLP/JSON, ``"readable"`` for the
+            human-readable rendering. A trace's two files differ in this and
+            nothing else.
+        failed: Tags a run that died on an unhandled exception, so a failure is
+            obvious in a directory listing.
+        timestamp: When the trace was captured; defaults to now. Rendered in UTC
+            -- an aware value is converted, a naive one is taken as already UTC.
+        sequence: Tiebreaker for traces that would otherwise share a name: same
+            script, same second, same outcome. ``0`` contributes nothing.
+
+    Returns:
+        A bare file name, e.g. ``2026-01-31_14-05-09_my_agent.error.otlp.json``.
+
+    See ``docs/design-notes.md`` ("Trace filenames") for why the parts are
+    ordered this way.
+    """
+    moment = timestamp if timestamp is not None else datetime.now(timezone.utc)
+    if moment.tzinfo is not None:
+        moment = moment.astimezone(timezone.utc)
+    stamp = moment.strftime("%Y-%m-%d_%H-%M-%S")
+    outcome = ".error" if failed else ""
+    tiebreak = f"_{sequence}" if sequence else ""
+    return f"{stamp}_{script_name}{outcome}{tiebreak}.{trace_format}.json"
+
+
+@dataclass(frozen=True)
+class _TraceNaming:
+    """The naming a trace commits to for the rest of the run.
+
+    Chosen the first time a trace is written and kept, so both of its files --
+    and any rewrite from a later emit -- land on the same names.
+    """
+
+    script_name: str
+    timestamp: datetime
+    failed: bool
+    sequence: int = 0
+
+    def filename(self, trace_format: TraceFormat) -> str:
+        """Return this trace's file name in ``trace_format``."""
+        return trace_filename(
+            self.script_name,
+            trace_format,
+            failed=self.failed,
+            timestamp=self.timestamp,
+            sequence=self.sequence,
+        )
 
 
 def _hex_encode_ids(node: Any) -> Any:
     """Return ``node`` with every OTLP id field re-encoded from base64 to hex.
 
-    :func:`~google.protobuf.json_format.MessageToDict` renders the ``bytes`` id
-    fields as base64 (the proto3 JSON default), but OTLP/JSON mandates hex for
-    exactly these fields. We walk the encoded structure and convert them,
-    leaving everything else untouched -- so the file is valid to POST back as
-    OTLP/JSON. Attribute payloads are safe from accidental rewriting: their
-    values live under ``key``/``value`` entries, never these reserved keys.
+    Walks the encoded structure, converting the reserved id keys and leaving
+    everything else untouched. See ``docs/design-notes.md`` ("Hex ids in
+    OTLP/JSON").
     """
     if isinstance(node, dict):
         return {
@@ -114,71 +128,71 @@ def _hex_encode_ids(node: Any) -> Any:
     return node
 
 
-class FileSpanExporter(SpanExporter):
+class FileSpanExporter(_BufferedExporter):
     """Persist spans to disk, one OTLP/JSON and one readable file per trace."""
 
-    def __init__(self, base_dir: Path, script_name: str) -> None:
+    def __init__(
+        self,
+        base_dir: Union[str, Path, None] = None,
+        script_name: Optional[str] = None,
+    ) -> None:
         """Prepare an exporter that writes traces under ``base_dir``.
+
+        Both arguments default to what :func:`argus.init` would derive, so
+        ``FileSpanExporter()`` is the default sink -- handy for keeping the trace
+        files while adding a sink of your own through ``exporters=``.
 
         Args:
             base_dir: Directory traces are written to; created (with parents)
-                if it doesn't already exist.
+                if it doesn't already exist. Defaults to ``<cwd>/traces``.
             script_name: Name stamped into each filename, identifying the run
-                that produced the trace.
-
-        The two ``_trace_*`` maps are the in-memory buffers keyed by trace id:
-        ``_trace_names`` remembers the chosen base name per trace (so both of a
-        trace's files keep a stable, matching stem) and ``_trace_spans``
-        accumulates the raw :class:`~opentelemetry.sdk.trace.ReadableSpan`
-        objects (kept unencoded so :meth:`emit` can render them to either
-        shape).
+                that produced the trace. Defaults to the running script's name
+                (see :func:`~argus.paths.detect_script_name`).
         """
-        self._base_dir = Path(base_dir)
+        super().__init__()
+        self._base_dir = (
+            Path(base_dir) if base_dir is not None else default_traces_dir()
+        )
         self._base_dir.mkdir(parents=True, exist_ok=True)
-        self._script_name = script_name
-        self._trace_names: dict[int, str] = {}
-        self._trace_spans: dict[int, List[ReadableSpan]] = {}
+        self._script_name = script_name or detect_script_name()
+        self._naming_by_trace: Dict[int, _TraceNaming] = {}
 
-    def _base_name_for_trace(self, trace_id: int, failed: bool) -> str:
-        """Return the shared file stem for ``trace_id``, allocating it once.
+    def _naming_for(self, trace_id: int, failed: bool) -> _TraceNaming:
+        """Return ``trace_id``'s naming, allocating it on first write.
 
-        The name encodes the run timestamp (a UTC ``YYYY-MM-DD_HH-MM-SS``
-        stamp), the script, and -- when ``failed`` -- an ``.error`` marker. It
-        carries no ``.json`` extension or format marker; :meth:`emit` appends
-        those to derive the OTLP and readable paths, so both files share this
-        exact stem. A numeric suffix is appended if a sibling trace from the
-        same run/second already claimed the name, so concurrent traces never
-        overwrite each other. The result is memoized so repeated calls for the
-        same trace return a stable name.
+        The outcome is captured here rather than at every write, so a trace first
+        written by a mid-run flush keeps that name if the run later fails: the
+        rewrite supersedes the same pair of files instead of scattering a second
+        pair beside them. ``sequence`` is raised until the name is free among the
+        names *this* exporter has allocated, which keeps sibling traces from the
+        same run and second off each other's files -- both formats share
+        everything but the marker, so one of them settles it. The directory is
+        not consulted, so a second process writing there in the same second can
+        still overwrite these files.
         """
-        if trace_id not in self._trace_names:
-            timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
-            outcome = ".error" if failed else ""
-            base_name = f"{timestamp}_{self._script_name}{outcome}"
-            # Guard against overwriting another trace from the same run/second.
-            used = set(self._trace_names.values())
-            candidate = base_name
-            suffix = 1
-            while candidate in used:
-                candidate = f"{base_name}_{suffix}"
-                suffix += 1
-            self._trace_names[trace_id] = candidate
-        return self._trace_names[trace_id]
+        naming = self._naming_by_trace.get(trace_id)
+        if naming is None:
+            claimed = {
+                taken.filename("otlp")
+                for taken in self._naming_by_trace.values()
+            }
+            naming = _TraceNaming(
+                self._script_name, datetime.now(timezone.utc), failed
+            )
+            while naming.filename("otlp") in claimed:
+                naming = replace(naming, sequence=naming.sequence + 1)
+            self._naming_by_trace[trace_id] = naming
+        return naming
 
-    def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
-        """Buffer a batch of finished spans, grouped by trace id.
-
-        Called by OpenTelemetry as spans end. We keep the raw
-        :class:`~opentelemetry.sdk.trace.ReadableSpan` objects (not a
-        serialized form) because :meth:`emit` renders them to both the OTLP and
-        readable shapes itself. Nothing touches disk here -- the write is
-        deferred so the filename can reflect the run's final outcome -- so this
-        always reports success.
-        """
+    @staticmethod
+    def _group_by_trace(
+        spans: List[ReadableSpan],
+    ) -> Dict[int, List[ReadableSpan]]:
+        """Return ``spans`` bucketed by trace id, each bucket in arrival order."""
+        traces: Dict[int, List[ReadableSpan]] = {}
         for span in spans:
-            trace_id = span.context.trace_id
-            self._trace_spans.setdefault(trace_id, []).append(span)
-        return SpanExportResult.SUCCESS
+            traces.setdefault(span.context.trace_id, []).append(span)
+        return traces
 
     @staticmethod
     def _in_generation_order(
@@ -186,17 +200,9 @@ class FileSpanExporter(SpanExporter):
     ) -> List[ReadableSpan]:
         """Return ``spans`` ordered by when each was generated (started).
 
-        Spans arrive from ``export`` in *end-time* order -- a leaf finishes
-        before the parent that wraps it -- so the buffer reads roughly
-        backwards, with the earliest-started (root) span landing last. We
-        restore the run's original chronology by sorting on ``start_time`` (the
-        epoch-nanosecond stamp OpenTelemetry records). Sorting on the real
-        timestamp rather than blindly reversing keeps siblings and concurrent
-        work correctly ordered.
-
-        The sort is stable and tolerates spans without a ``start_time`` (they
-        keep their relative arrival order), so nothing is lost if the field is
-        ever absent.
+        Spans arrive in end-time order, so this restores the run's chronology.
+        The sort is stable and tolerates a missing ``start_time``. See
+        ``docs/design-notes.md`` ("Generation order").
         """
         return sorted(spans, key=lambda span: span.start_time or 0)
 
@@ -208,74 +214,41 @@ class FileSpanExporter(SpanExporter):
             handle.write("\n")
 
     @staticmethod
-    def _to_readable(spans: List[ReadableSpan]) -> List[dict]:
+    def _to_readable(spans: List[ReadableSpan]) -> List[Dict[str, Any]]:
         """Render ordered spans to the human-readable JSON shape.
 
-        Each span goes through OpenTelemetry's own ``to_json`` (snake_case
-        fields, hex ids, ISO timestamps) and then
+        Each span goes through OpenTelemetry's own ``to_json`` and then
         :func:`~argus.json_utils.expand_embedded_json`, which unescapes any
-        attribute value that is itself a JSON string so nested payloads read as
-        structured data rather than an escaped blob.
+        attribute value that is itself a JSON string.
         """
         return [
             expand_embedded_json(json.loads(span.to_json(indent=None)))
             for span in spans
         ]
 
-    def emit(self, failed: bool = False) -> None:
-        """Persist all buffered traces, an OTLP/JSON and a readable file each.
-
-        For every trace we write two files sharing a base name: the ``.otlp.json``
-        is a single ``ExportTraceServiceRequest`` (the OTLP wire message) so its
-        on-disk shape matches what the remote sink POSTs, and the
-        ``.readable.json`` is a plain list of human-readable spans. ``failed``
-        tags the run's outcome in the base name so a partial/errored run is still
-        captured (and obvious) rather than silently discarded. Spans within each
-        trace are encoded in generation order (see :meth:`_in_generation_order`)
-        so both files read top-to-bottom as the run unfolded.
-
-        The buffer is *not* cleared afterwards, so a repeat call rewrites each
-        trace's pair of files with everything buffered for it rather than
-        appending a fragment. That keeps every file a complete trace even when a
-        program flushes mid-run and keeps working (see
-        :meth:`argus.Session.flush`); the base name is allocated once per trace,
-        so the rewrite lands on the same two files instead of scattering partial
-        ones through the directory. The remote sink makes the opposite choice --
-        it clears on a confirmed send -- because re-POSTing spans duplicates
-        them at the backend, where rewriting a file simply supersedes it.
-        """
-        for trace_id, spans in self._trace_spans.items():
-            base_name = self._base_name_for_trace(trace_id, failed)
-            ordered = self._in_generation_order(spans)
-
-            request = encode_spans(ordered)
-            self._write_json(
-                self._base_dir / f"{base_name}{_OTLP_SUFFIX}",
-                _hex_encode_ids(MessageToDict(request)),
-            )
-            self._write_json(
-                self._base_dir / f"{base_name}{_READABLE_SUFFIX}",
-                self._to_readable(ordered),
-            )
-
-    def force_flush(self, timeout_millis: int = 30_000) -> bool:
-        """Satisfy the ``SpanExporter`` interface; a no-op here.
-
-        Spans are held in memory until :meth:`emit`, so there is
-        nothing to flush on demand. Always reports success.
+    def _deliver(self, spans: List[ReadableSpan], *, failed: bool) -> bool:
+        """Write each buffered trace's pair of files, keeping the buffer.
 
         Args:
-            timeout_millis: Accepted only to match the base
-                :class:`~opentelemetry.sdk.trace.export.SpanExporter` signature
-                (``force_flush(self, timeout_millis: int = 30000)``). There is
-                no asynchronous work to bound, so the value is ignored.
-        """
-        return True
+            spans: Every span buffered so far, grouped into traces here.
+            failed: Tags the run's outcome into each trace's file names, so a
+                crashed run is captured and obvious rather than discarded.
 
-    def shutdown(self) -> None:
-        """Satisfy the ``SpanExporter`` interface; a no-op here.
-
-        The on-exit write is driven explicitly by Argus via
-        :meth:`emit`, so no resources need releasing at shutdown.
+        Returns:
+            ``False`` always: the buffer is retained so a later emit rewrites
+            each file from the complete trace rather than appending a fragment.
+            See ``docs/design-notes.md`` ("Repeat emits: rewrite or clear").
         """
-        pass
+        for trace_id, trace_spans in self._group_by_trace(spans).items():
+            naming = self._naming_for(trace_id, failed)
+            ordered = self._in_generation_order(trace_spans)
+
+            self._write_json(
+                self._base_dir / naming.filename("otlp"),
+                _hex_encode_ids(MessageToDict(encode_spans(ordered))),
+            )
+            self._write_json(
+                self._base_dir / naming.filename("readable"),
+                self._to_readable(ordered),
+            )
+        return False

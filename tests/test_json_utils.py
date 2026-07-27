@@ -7,34 +7,30 @@ import pytest
 from argus.json_utils import expand_embedded_json
 
 
-def test_expands_embedded_object_string():
-    assert expand_embedded_json('{"k": 1}') == {"k": 1}
+class TestExpandEmbeddedJson:
+    def test_expands_embedded_object_string(self):
+        assert expand_embedded_json('{"k": 1}') == {"k": 1}
 
+    def test_expands_embedded_array_string(self):
+        assert expand_embedded_json("[1, 2, 3]") == [1, 2, 3]
 
-def test_expands_embedded_array_string():
-    assert expand_embedded_json("[1, 2, 3]") == [1, 2, 3]
+    def test_leaves_plain_text_untouched(self):
+        assert expand_embedded_json("just a string") == "just a string"
 
+    def test_invalid_json_object_string_is_returned_verbatim(self):
+        assert expand_embedded_json("{not valid json}") == "{not valid json}"
 
-def test_leaves_plain_text_untouched():
-    assert expand_embedded_json("just a string") == "just a string"
+    def test_recurses_into_dicts_and_lists(self):
+        value = {
+            "outer": '{"inner": "[1, 2]"}',
+            "items": ['{"a": 1}', "plain"],
+        }
 
+        assert expand_embedded_json(value) == {
+            "outer": {"inner": [1, 2]},
+            "items": [{"a": 1}, "plain"],
+        }
 
-def test_invalid_json_object_string_is_returned_verbatim():
-    assert expand_embedded_json("{not valid json}") == "{not valid json}"
-
-
-def test_recurses_into_dicts_and_lists():
-    value = {
-        "outer": '{"inner": "[1, 2]"}',
-        "items": ['{"a": 1}', "plain"],
-    }
-
-    assert expand_embedded_json(value) == {
-        "outer": {"inner": [1, 2]},
-        "items": [{"a": 1}, "plain"],
-    }
-
-
-@pytest.mark.parametrize("value", [1, 1.5, True, None])
-def test_non_string_scalars_pass_through(value):
-    assert expand_embedded_json(value) == value
+    @pytest.mark.parametrize("value", [1, 1.5, True, None])
+    def test_non_string_scalars_pass_through(self, value):
+        assert expand_embedded_json(value) == value

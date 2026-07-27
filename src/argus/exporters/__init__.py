@@ -1,37 +1,33 @@
 """Span exporters: the sinks that decide where captured traces end up.
 
 Argus ships two, and they share one lifecycle: buffer spans in memory as they
-end, then do the real work in an ``emit(failed=...)`` call Argus drives on exit.
+end, then do the real work in an ``emit(failed=...)`` call Argus drives on flush.
 :class:`~argus.exporters.file.FileSpanExporter` writes each trace to disk twice
 -- canonical OTLP/JSON and a human-readable rendering;
-:class:`~argus.exporters.otlp.OTLPSpanExporter` POSTs the buffered run to a
-remote backend over OTLP/HTTP.
+:class:`~argus.exporters.otlp.BufferedOTLPExporter` POSTs the buffered run to a
+remote backend over OTLP/HTTP, configured by
+:class:`~argus.exporters.otlp.OtlpConfig`.
 
-What differs is how each one handles a *second* ``emit``, and the destination is
-why. A flush is not terminal -- spans produced after one are emitted by the next
-(see :meth:`argus.Session.flush`) -- so both sinks have to stay correct when
-called again:
+:class:`~argus.exporters.base.BufferedSpanExporter` is that lifecycle expressed
+as a :class:`typing.Protocol`, and the typed extension point for a sink of your
+own: any exporter satisfying it is driven through ``emit`` (and handed the run's
+outcome) instead of ``force_flush``.
 
-* The file sink keeps its buffer and rewrites each trace's files from scratch,
-  so what lands on disk is always the complete trace rather than the slice that
-  arrived since the last write.
-* The remote sink drops its buffer once the backend confirms the batch, so a
-  later emit sends only what has not been ingested -- and nothing at all when
-  everything already has.
+:func:`~argus.exporters.file.trace_filename` is the on-disk naming scheme in one
+function, for code that has to reproduce or parse what the file sink writes.
 
-Both are re-exported here (with the
-:func:`~argus.exporters.otlp.make_otlp_exporter` convenience factory) so callers
-can reach them as ``argus.exporters.<name>`` regardless of the module layout.
+See ``docs/design-notes.md`` ("Buffer now, emit once", "Repeat emits: rewrite or
+clear", "Exporters Argus does not own").
 """
 
-from .file import FileSpanExporter
-from .otlp import (
-    OTLPSpanExporter,
-    make_otlp_exporter,
-)
+from .base import BufferedSpanExporter
+from .file import FileSpanExporter, trace_filename
+from .otlp import BufferedOTLPExporter, OtlpConfig
 
 __all__ = [
+    "BufferedOTLPExporter",
+    "BufferedSpanExporter",
     "FileSpanExporter",
-    "OTLPSpanExporter",
-    "make_otlp_exporter",
+    "OtlpConfig",
+    "trace_filename",
 ]
