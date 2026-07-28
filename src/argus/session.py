@@ -27,6 +27,7 @@ from typing import Literal
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import (
     ReadableSpan,
+    SpanLimits,
     SpanProcessor,
     TracerProvider,
 )
@@ -42,7 +43,6 @@ from .detection import (
 from .exporters.base import BufferedSpanExporter
 from .exporters.file import FileSpanExporter
 from .exporters.otlp import BufferedOTLPExporter, OtlpConfig
-from .limits import _resolve_span_limits
 from .paths import default_traces_dir, detect_script_name
 
 # The single session for this process; ``init`` enforces the singleton.
@@ -51,6 +51,14 @@ _session: Session | None = None
 # the atexit flush can tag the trace as a failure.
 _run_failed = False
 _excepthook_installed = False
+
+# OpenTelemetry caps a span at 128 attributes and silently evicts the oldest ones
+# past that, which on a long agent conversation drops the model's final output.
+# Argus fixes the ceiling far past any realistic run -- deliberately not
+# configurable, since the only thing a lower value buys is silent trace loss and
+# the ceiling costs no memory until the attributes actually exist. See
+# ``docs/design-notes.md`` ("The raised span-attribute ceiling").
+_MAX_SPAN_ATTRIBUTES = 50_000
 
 
 def _warn_reinit(existing: Session, project: str) -> None:
@@ -550,7 +558,7 @@ def init(
     # of the provider's atexit shutdown").
     provider = TracerProvider(
         resource=_build_resource(project, service),
-        span_limits=_resolve_span_limits(),
+        span_limits=SpanLimits(max_span_attributes=_MAX_SPAN_ATTRIBUTES),
         shutdown_on_exit=False,
     )
     # Registered before the exporters' processors so the session can tell

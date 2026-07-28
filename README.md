@@ -230,20 +230,14 @@ conversation crosses 128 mid-run -- and what gets evicted includes the model's
 final output message. `init` therefore raises the ceiling to **50,000**: far past
 any realistic run, while keeping a rail against a pathological one.
 
-It is deliberately not an `init` argument (the reasoning is in [the design
-notes](docs/design-notes.md#the-raised-span-attribute-ceiling)). The standard
-OpenTelemetry variables are the escape hatch for the rare case that needs one, in
-OpenTelemetry's own precedence:
-
-| Variable                          | Read as                                                                                                                    |
-| --------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT` | The span attribute ceiling. Set it to nothing at all for **no limit**.                                                      |
-| `OTEL_ATTRIBUTE_COUNT_LIMIT`      | The all-signals fallback, consulted only when the span-specific variable gives nothing usable. Set to nothing at all it is indistinguishable from unset, so it is ignored rather than read as "no limit". |
-
-Argus's 50,000 applies only when neither variable gives a usable value, and
-anything that is not a non-negative integer counts as unusable and falls through
-to the next source. Only the attribute _count_ is raised: the limits on events,
-links, and attribute value lengths keep whatever OpenTelemetry resolves for them.
+The ceiling is fixed and not configurable -- it is neither an `init` argument
+nor read from an environment variable. The only thing a lower value could buy is
+silently capturing less of your trace, which is the exact loss the raised ceiling
+exists to prevent, and the ceiling costs no memory until that many attributes
+actually exist -- so there is no upside to tuning it down. Only the attribute
+_count_ is raised: the limits on events, links, and attribute value lengths keep
+whatever OpenTelemetry resolves for them. The reasoning is in [the design
+notes](docs/design-notes.md#the-raised-span-attribute-ceiling).
 
 ## Remote export over OTLP
 

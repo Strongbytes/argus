@@ -354,22 +354,29 @@ Argus raises the ceiling to 50,000: far past any realistic run, while keeping a
 rail against a pathological one. At roughly three attributes per chat message
 that holds on the order of ten thousand messages in a single span.
 
-It is deliberately not an `init` argument. Choosing the value well requires
-knowing OpenInference's per-message flattening, and a too-low value fails
-silently. The standard OpenTelemetry environment variables remain the escape
-hatch for the rare caller who must tune it, in OpenTelemetry's own precedence:
-`OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT` first, then the generic
-`OTEL_ATTRIBUTE_COUNT_LIMIT`. The generic variable is read even though Argus
-always passes an explicit span limit, because OpenTelemetry uses it only as the
-*default* for the span-specific limit — so an explicit Argus value would
-silently shadow a ceiling an operator deliberately set.
+The ceiling is fixed, and deliberately not configurable — neither an `init`
+argument nor read from any environment variable. Three things make an adjustable
+ceiling all cost and no benefit here:
 
-The two variables differ on what an empty value means, and Argus mirrors that:
-for the span-specific limit, empty *is* how "no limit" is spelled, while an
-empty generic limit is indistinguishable from an unset one. Only the span
-attribute *count* is touched; events, links, attribute lengths, and the generic
-ceiling's effect on event and link attributes keep whatever OpenTelemetry
-resolves for them.
+- **A too-low value fails silently.** Recording less than a run produced is the
+  exact loss the raised ceiling exists to prevent, and it surfaces as a missing
+  final message rather than an error — so a knob whose main effect is "quietly
+  capture less" undercuts the whole point of the tool.
+- **Raising it higher rescues no real run.** The limit is a `maxlen` on the
+  span's attribute container, not a preallocation, so it costs no memory until
+  that many attributes actually exist. 50,000 already sits far past any realistic
+  run while still bounding a pathological one, so no larger value buys anything.
+- **Choosing a value well needs internals.** It requires knowing OpenInference's
+  per-message flattening — Argus's job to settle once, not the caller's to
+  rediscover, and a too-low guess fails silently as above.
+
+This is the one place Argus overrides a standard OpenTelemetry setting rather
+than deferring to it: it does not honor OpenTelemetry's own attribute-count
+limits, because an externally lowered ceiling would reintroduce exactly the
+silent truncation the fixed value removes. The endpoint and headers variables,
+which carry deployment wiring rather than a capture policy, still apply to remote
+export. Only the attribute *count* is fixed; events, links, and attribute value
+lengths keep whatever OpenTelemetry resolves for them.
 
 ## Remote export is one argument
 
