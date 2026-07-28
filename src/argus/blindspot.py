@@ -1,9 +1,12 @@
 """The Argus escape hatch: :class:`blindspot`, a region the watcher ignores.
 
 Argus records everything by default. When a workflow -- or a slice of one --
-should stay off the record, :class:`blindspot` carves out a scope where no spans
-are created at all, by attaching OpenTelemetry's own suppression flag to the
-active context. The same object works three ways::
+should stay off the record, :class:`blindspot` attaches OpenTelemetry's own
+suppression flag to the active context. Every OpenInference instrumentor checks
+that flag before recording, so the model calls, tool calls and agent steps
+inside the block never exist. A span you start yourself with
+``tracer.start_as_current_span`` is *not* subject to it -- skip those yourself.
+The same object works three ways::
 
     with argus.blindspot():            # synchronous block
         run_sensitive_step()

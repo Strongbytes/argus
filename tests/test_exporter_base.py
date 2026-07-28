@@ -14,8 +14,8 @@ from typing import Any
 
 from opentelemetry.sdk.trace.export import SpanExportResult
 
-from argus.exporters import BufferedSpanExporter, Delivery, FileSpanExporter
-from argus.exporters.base import _DeferredExporter
+from argus.exporters import BufferedSpanExporter, FileSpanExporter
+from argus.exporters.base import Delivery, _DeferredExporter
 
 from tests.factories import PlainSpanExporter, make_span
 

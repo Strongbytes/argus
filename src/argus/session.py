@@ -496,7 +496,8 @@ def init(
             ``argus.project``. A project may span several services.
         service: Identity of the observed application, stamped as the
             OpenTelemetry ``service.name``. Defaults to the running script's
-            name, or ``"session"`` where there is no script file (see
+            name, falling back to ``"session"`` for a REPL, an embedded
+            interpreter, or piped stdin (see
             :func:`~argus.paths.detect_script_name`).
         instrument: ``None``/``"curated"`` for curated auto-detection
             (default), ``"all"`` for entry-point discovery, or a key / list of
@@ -649,6 +650,10 @@ def _flush_on_exit() -> None:
     try:
         _session.flush()
     except Exception:
-        # Never let trace flushing crash interpreter shutdown.
+        # The one place a swallowed error is *not* warned about (see
+        # ``docs/design-notes.md``, "Swallowed errors are still audible"): a
+        # warning from the atexit hook, mid interpreter shutdown, is not
+        # something a caller can rely on seeing, and letting this escape would
+        # crash shutdown. The exporters are still closed below regardless.
         pass
     _session._shutdown_exporters()

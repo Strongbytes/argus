@@ -154,7 +154,7 @@ pytest --cov --cov-report=html     # also write an htmlcov/ report to browse
 | Argument      | Default              | Notes                                                                                                                                |
 | ------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
 | `project`     | (required)           | Argus's logical run umbrella; stamped onto every span as `argus.project`. May span several services.                                 |
-| `service`     | script name          | Observed app identity; stamped as OpenTelemetry `service.name`. Defaults to the running script's name, or `session` where there is no script file (a REPL, an embedded interpreter). |
+| `service`     | script name          | Observed app identity; stamped as OpenTelemetry `service.name`. Defaults to the running script's name, falling back to `session` where there is no usable script name (a REPL, an embedded interpreter, or piped stdin). |
 | `instrument`  | `None`               | `None`/`"curated"` = curated auto-detection; `"all"` = entry-point discovery; a key or list of keys (`"openai_agents"`, `["agno"]`). An unknown key raises `ValueError` listing the known ones. |
 | `output_dir`  | `<cwd>/traces`       | Directory the default file exporter writes to. Configures that exporter only, so it has no effect (and warns) alongside `exporters`.  |
 | `exporters`   | `[FileSpanExporter]` | Replace the default sink with your own OpenTelemetry exporters. See [Custom exporters](#custom-exporters).                            |
@@ -265,6 +265,10 @@ on:
 ```bash
 pip install "argus-trace[otlp]"
 ```
+
+Enabling `otlp` without that extra installed raises `ImportError` at your
+`init(...)` line, naming the exact `pip install` needed. It fails there rather
+than at exit -- the same fail-early stance the endpoint and key below follow.
 
 ```python
 import argus
@@ -493,8 +497,11 @@ want something else: `FileSpanExporter("./my_traces", script_name="my_agent")`.
 
 Argus records everything by default. When a particular workflow -- or a slice
 of one -- should stay off the record (secrets, PII, or just noise), wrap it in
-a `blindspot`. Inside the scope no spans are created at all: suppression happens
-at the source, so nothing is buffered or written.
+a `blindspot`. What the scope suppresses is instrumentor spans: the flag Argus
+sets is the one every OpenInference instrumentor checks before recording, so the
+model calls, tool calls and agent steps inside the block never exist -- nothing
+is buffered or written for them. A span you start yourself with
+`tracer.start_as_current_span` is not subject to it; skip those yourself.
 
 It works as a context manager (sync or async) and as a decorator on either
 kind of function:

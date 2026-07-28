@@ -498,18 +498,24 @@ connection-level error can still escape as an exception.
 
 ## Swallowed errors are still audible
 
-Three places catch `Exception` and carry on: draining a stock exporter with
-`force_flush`, closing the exporters at exit, and uninstrumenting on `reset`.
-The reason is the same each time, and it is the right one — an exporter or an
-instrumentor Argus does not own must not take the host program down, nor stop
-the ones after it from being driven.
+Four places catch `Exception` and carry on. Three of them warn once they have:
+draining a stock exporter with `force_flush`, closing the exporters at exit, and
+uninstrumenting on `reset`. The reason is the same each time, and it is the right
+one — an exporter or an instrumentor Argus does not own must not take the host
+program down, nor stop the ones after it from being driven.
 
 Saying nothing about it is not. A bare `pass` means a custom exporter that
 raises on every call produces no trace, no error and no clue, which leaves
 `exporters=` the least debuggable part of the API at exactly the moment it is
-broken. Each swallowed error therefore warns, the same way a [failed remote
+broken. Each of those three therefore warns, the same way a [failed remote
 delivery](#delivery-failures-warn-never-raise) does: a `RuntimeWarning` naming
 the object, the call, and what it raised.
+
+The fourth is a deliberate exception. The on-exit flush itself is wrapped in a
+bare `pass`, because it runs from the `atexit` hook while the interpreter is
+already tearing down — a warning there is not something a caller can count on
+seeing, and letting the exception escape would crash shutdown. The exporters are
+still closed afterwards regardless.
 
 Two details keep that from becoming noise of its own. The report is deduped per
 object and call, because `flush` may run many times over a session and a sink
@@ -547,9 +553,15 @@ not an invitation to drop the dependency.
 `blindspot` attaches OpenTelemetry's own `_SUPPRESS_INSTRUMENTATION_KEY` to the
 active context. OpenInference's instrumentors — and OTel-aware libraries in
 general — check that flag and skip span creation entirely while it is set, so
-nothing is created, buffered, or written. Suppressing at the source rather than
-dropping spans after the fact means sensitive payloads never enter the pipeline
-at all.
+an instrumentor span is never created, buffered, or written. Suppressing at the
+source rather than dropping spans after the fact means sensitive payloads never
+enter the pipeline at all.
+
+The flag reaches only code that consults it. The SDK's own `Tracer.start_span`
+does not, so a span a caller starts by hand through `provider.get_tracer(...)`
+(a [documented path](../README.md#the-session-object)) is recorded even inside a
+blindspot — the scope covers the instrumentors, not manual spans. Keep manual
+spans out of a sensitive region yourself.
 
 Because the flag rides on a `contextvars`-backed context, the suppression
 follows `await` points and copies into tasks spawned inside the block. It does

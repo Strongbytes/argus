@@ -14,6 +14,7 @@ the thing you're trying to do.
 
 - [The shortest thing that works](#the-shortest-thing-that-works)
 - [OpenAI Agents SDK](#openai-agents-sdk)
+- [Claude Agent SDK](#claude-agent-sdk)
 - [Agno](#agno)
 - [The OpenAI client, used directly](#the-openai-client-used-directly)
 - [Choosing the instrumentors yourself](#choosing-the-instrumentors-yourself)
@@ -73,6 +74,31 @@ defaults to the script's name when you leave it out.
 Importing first is a preference, not a requirement — Argus falls back to asking
 whether the module is importable — but it is the reliable signal, and it costs
 nothing to put your imports at the top.
+
+## Claude Agent SDK
+
+`pip install "argus-trace[claude]"`, and import the SDK before `init` so
+detection sees it already loaded:
+
+```python
+import anyio
+import argus
+from claude_agent_sdk import query
+
+argus.init("support-bot")
+
+
+async def main():
+    async for message in query(prompt="Summarize today's incidents."):
+        print(message)
+
+
+anyio.run(main)
+```
+
+Detecting the Claude Agent SDK turns on `ClaudeAgentSDKInstrumentor`, so each
+`query` is captured without your naming it. The one-shot `query` above is the
+shortest form; a stateful `ClaudeSDKClient` session traces the same way.
 
 ## Agno
 
@@ -387,6 +413,14 @@ except BatchError:
     session.flush(failed=True)   # you handled it; record it as a failed run
     raise SystemExit(1)
 ```
+
+The marker lands when this is the run's first flush — which it is for a script
+that otherwise flushes only on exit. A `flush(failed=True)` that *follows* an
+earlier flush (a context manager, an explicit `session.flush()`) with no new
+spans since is a no-op, and the files keep the names that first flush chose: a
+trace's outcome is fixed when it is first written, not re-evaluated on every
+flush (see [design notes](design-notes.md#trace-filenames)). So flush once, at
+the end, when you want the failure in the file names.
 
 ## Adding spans of your own
 

@@ -84,19 +84,27 @@ class TestExportersSurface:
         assert set(exporters.__all__) == {
             "BufferedOTLPExporter",
             "BufferedSpanExporter",
-            "Delivery",
             "FileSpanExporter",
             "OtlpConfig",
+            "TraceFormat",
             "trace_filename",
         }
 
     def test_names_resolve_to_their_defining_modules(self):
         assert exporters.BufferedSpanExporter is base.BufferedSpanExporter
-        assert exporters.Delivery is base.Delivery
         assert exporters.FileSpanExporter is file.FileSpanExporter
         assert exporters.BufferedOTLPExporter is otlp.BufferedOTLPExporter
         assert exporters.OtlpConfig is otlp.OtlpConfig
         assert exporters.trace_filename is file.trace_filename
+        assert exporters.TraceFormat is file.TraceFormat
+
+    def test_delivery_is_internal_to_base(self):
+        # Delivery is the return type of the private _DeferredExporter._deliver;
+        # a third-party sink implements ``emit`` (the BufferedSpanExporter
+        # protocol) and never encounters it, so it stays out of the package
+        # surface rather than promising a name nothing hands back.
+        assert not hasattr(exporters, "Delivery")
+        assert "Delivery" not in exporters.__all__
 
     def test_the_remote_sink_does_not_shadow_otels_own_name(self):
         # OpenTelemetry ships an ``OTLPSpanExporter`` that streams spans;

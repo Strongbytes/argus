@@ -21,6 +21,16 @@ from typing import Any, Literal, Protocol, runtime_checkable
 
 from opentelemetry.trace import TracerProvider
 
+# The public surface: the extension-point protocol and the key/strategy types
+# ``instrument=`` accepts, all documented in the README and examples. Everything
+# else in this module is Argus-internal detection machinery.
+__all__ = [
+    "InstrumentKey",
+    "InstrumentSelection",
+    "InstrumentStrategy",
+    "Instrumentor",
+]
+
 # The entry-point group OpenInference instrumentors publish themselves under.
 # It backs ``instrument="all"`` alone, which loads every instrumentor registered
 # in the group without consulting a key; the curated registry below is a
