@@ -1,3 +1,18 @@
+## v0.7.0 (2026-07-28)
+
+### Feat
+
+- remove limits of span attributes, keep only internal logic
+- more QOL items, changed tests, changed internals
+- QOL changes, public interface & tests
+- interface cleanup, remove unnecessary args
+
+### Fix
+
+- QOL arunds docs
+- more QOL
+- address inconsistencies across codebase
+
 ## v0.6.0 (2026-07-27)
 
 ### Feat
