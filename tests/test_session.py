@@ -58,16 +58,11 @@ class TestInit:
     def test_provider_does_not_register_its_own_atexit_shutdown(
         self, use_instrumentors, recording_exporter
     ):
-        # Regression guard for an atexit ordering collision. A TracerProvider
-        # registers its own atexit shutdown by default, and atexit runs LIFO;
-        # since Argus's _flush_on_exit is registered at import (before any
-        # provider), that shutdown would run first on exit and tear down the
-        # OTLP transport before Argus's flush emits -- so emit() would hit an
-        # already-dead transport and the backend would never be contacted.
-        # Argus owns the lifecycle, so the provider must register no handler.
-        # There is no public way to ask, so this reads a private OTel attribute
-        # deliberately: if an SDK upgrade renames it, this test failing is the
-        # cheapest possible warning that the wiring needs rechecking.
+        # Regression guard: Argus opts out of the provider's own atexit shutdown
+        # so it can't tear down exporters before Argus's flush emits (see
+        # docs/design-notes.md, "Opting out of the provider's atexit shutdown").
+        # Reads a private OTel attribute deliberately -- there is no public way
+        # to ask, so a rename here is the cheapest warning that wiring changed.
         use_instrumentors()
         session = argus.init("proj", exporters=[recording_exporter])
 
@@ -112,10 +107,8 @@ class TestTheDocumentedOneLiner:
         return sorted(traces_dir.iterdir())
 
     def test_exit_writes_the_documented_pair_of_files(self, written):
-        # The stem is read back rather than pinned -- under pytest the script
-        # name is the runner's, not an agent script's -- because what the README
-        # promises is the pair: one base name, two format markers.
-        # ``tests/test_file_exporter.py`` pins the scheme itself.
+        # The stem is read back, not pinned (under pytest it's the runner's): what
+        # matters here is the pair -- one base name, two format markers.
         otlp, readable = written
         assert otlp.name.endswith(".otlp.json")
         assert readable.name.endswith(".readable.json")

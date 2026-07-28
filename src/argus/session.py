@@ -415,23 +415,12 @@ class Session:
     ) -> None:
         """Warn about an error Argus deliberately ignored, once per target.
 
-        Argus never lets a sink or an instrumentor crash the host program, but
-        swallowing the error in silence leaves both extension points
-        undebuggable -- the same reasoning that makes a failed remote delivery
-        warn instead of vanishing. Emitted as a :class:`RuntimeWarning`, so
-        ``python -W error`` promotes it for callers who want these strict.
-
-        Repeats are dropped because :meth:`flush` may run many times over a
-        session and a sink that fails once usually fails every time, which would
-        bury the first report. The dedupe key is the target's identity, which is
-        safe here because a :class:`Session` holds every exporter and
-        instrumentor it drives for its whole life, so none can be collected and
-        have its ``id`` reused.
-
-        Every caller swallows one call directly, so ``stacklevel=3`` attributes
-        the warning to whoever asked for the work -- the ``flush()`` or
-        ``reset()`` line in the caller's own code -- rather than to Argus. On the
-        exit path there is no such frame, and it lands on the ``atexit`` hook.
+        A swallowed sink/instrumentor failure must not crash the host program,
+        but staying silent would leave those extension points undebuggable, so it
+        surfaces as a :class:`RuntimeWarning` (promotable with ``python -W
+        error``). Repeats for the same target and operation are dropped -- the
+        first report is the useful one. See ``docs/design-notes.md`` ("Swallowed
+        errors are still audible").
 
         Args:
             operation: The method that raised, named as its author knows it.

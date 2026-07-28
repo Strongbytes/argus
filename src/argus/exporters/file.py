@@ -160,15 +160,12 @@ class FileSpanExporter(_DeferredExporter):
     def _naming_for(self, trace_id: int, failed: bool) -> _TraceNaming:
         """Return ``trace_id``'s naming, allocating it on first write.
 
-        The outcome is captured here rather than at every write, so a trace first
-        written by a mid-run flush keeps that name if the run later fails: the
-        rewrite supersedes the same pair of files instead of scattering a second
-        pair beside them. ``sequence`` is raised until the name is free among the
-        names *this* exporter has allocated, which keeps sibling traces from the
-        same run and second off each other's files -- both formats share
-        everything but the marker, so one of them settles it. The directory is
-        not consulted, so a second process writing there in the same second can
-        still overwrite these files.
+        The outcome is captured on first write and kept, and ``sequence`` is
+        raised until the name is free among those this exporter has allocated, so
+        a trace's two files stay together and siblings from the same run and
+        second don't collide. The directory isn't consulted, so another process
+        writing there can still overwrite these files. See ``docs/design-notes.md``
+        ("Trace filenames").
         """
         naming = self._naming_by_trace.get(trace_id)
         if naming is None:

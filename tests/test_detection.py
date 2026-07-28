@@ -422,10 +422,8 @@ class TestAutoKeys:
             lambda name: name in {"agno", "openai"},
         )
 
-        # Cosmetic rather than load-bearing -- agno's entry pairs the OpenAI
-        # instrumentor in already, so the resolved classes are the same either
-        # way -- but pinned because the selection would otherwise read as the
-        # double instrumentation that dedupe quietly prevents.
+        # agno already pairs in the OpenAI instrumentor, so dropping the
+        # standalone "openai" key changes the detected keys, not the classes.
         assert detection._auto_keys() == ["agno"]
 
     def test_keeps_openai_when_it_is_the_only_framework(self, monkeypatch):

@@ -385,10 +385,8 @@ class TestAuthWiring:
         }
 
     def test_headers_are_always_passed_to_the_transport(self, fake_transport):
-        # No headers argument, no api_key argument -- and the transport is still
-        # handed an explicit mapping. That is what keeps the transport's own
-        # OTEL_EXPORTER_OTLP_*_HEADERS variables permanently inert: it reads
-        # them only when it is given no headers at all.
+        # Argus always hands the transport an explicit headers mapping, which is
+        # what keeps its OTEL_EXPORTER_OTLP_*_HEADERS variables permanently inert.
         BufferedOTLPExporter("http://localhost:9000/ingest")
 
         assert fake_transport.captured["headers"] == {
@@ -521,11 +519,8 @@ class TestInitOtlpIntegration:
         )
 
     def test_otlp_true_without_endpoint_raises(self):
-        # otlp=True with no endpoint anywhere is a misconfiguration: fail loudly
-        # at init rather than silently posting to a guessed target. (The autouse
-        # clean_endpoint_env fixture cleared both endpoint variables.) No
-        # transport fixture: the endpoint is resolved on the way into
-        # ``_build_transport``, so this fails before there is one to fake.
+        # otlp=True with no endpoint anywhere must fail loudly at init. No
+        # transport fixture: the endpoint is resolved before one is built.
         with pytest.raises(ValueError, match="OTLP endpoint"):
             argus.init("proj", otlp=True)
 
@@ -543,11 +538,8 @@ class TestInitOtlpIntegration:
     def test_config_headers_and_timeout_reach_the_transport(
         self, fake_transport
     ):
-        # The settings that used to need a hand-built exporter passed through
-        # ``exporters=`` now ride on the config, so remote export stays a
-        # one-argument decision even when customized. The timeout is fractional
-        # because the transport takes float seconds, so sub-second budgets have
-        # to survive the pass-through intact.
+        # headers and timeout ride on the config, so remote export stays a
+        # one-argument decision. The timeout is fractional to pin float pass-through.
         argus.init(
             "proj",
             otlp=OtlpConfig(
@@ -641,10 +633,9 @@ class TestOtlpArgumentShape:
             argus.init("proj", api_key=_KEY)
 
     def test_an_endpoint_string_names_its_replacement(self):
-        # The pre-config spelling. It has to fail loudly rather than be read as
-        # a truthy "on", which would silently ignore the endpoint given. The
-        # argument is validated before init creates anything at all, so there is
-        # nothing here to point at a temporary directory or a fake transport.
+        # The pre-config string spelling must fail loudly, not be read as a
+        # truthy "on" that ignores the endpoint. Validated before init creates
+        # anything, so there is nothing to fake here.
         with pytest.raises(TypeError, match="OtlpConfig") as excinfo:
             argus.init("proj", otlp="http://localhost:9000/ingest")
 
@@ -684,9 +675,7 @@ class TestOtlpArgumentShape:
         with pytest.raises(TypeError):
             argus.init("proj", otlp=42, output_dir=traces_dir)
 
-        # The one place output_dir is still worth passing: it names the directory
-        # this asserts was never created. Validated before any provider, exporter
-        # or directory exists, so a rejected call leaves nothing behind to clean
-        # up -- including the singleton, which a later init still needs to claim.
+        # A rejected otlp arg is validated before anything is created, so the
+        # output_dir directory is never made and the singleton stays unclaimed.
         assert not traces_dir.exists()
         assert session_module._session is None

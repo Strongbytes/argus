@@ -99,10 +99,8 @@ class TestExportersSurface:
         assert exporters.TraceFormat is file.TraceFormat
 
     def test_delivery_is_internal_to_base(self):
-        # Delivery is the return type of the private _DeferredExporter._deliver;
-        # a third-party sink implements ``emit`` (the BufferedSpanExporter
-        # protocol) and never encounters it, so it stays out of the package
-        # surface rather than promising a name nothing hands back.
+        # Delivery is internal to _DeferredExporter._deliver; a third-party sink
+        # implements ``emit`` and never encounters it, so it stays unexported.
         assert not hasattr(exporters, "Delivery")
         assert "Delivery" not in exporters.__all__
 

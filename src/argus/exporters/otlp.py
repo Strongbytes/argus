@@ -75,16 +75,15 @@ def _resolve_endpoint(endpoint: str | None) -> str:
     Precedence follows OpenTelemetry's own: an explicit ``endpoint`` argument,
     then ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT``, then the all-signals
     ``OTEL_EXPORTER_OTLP_ENDPOINT`` with ``v1/traces`` appended. An explicit
-    endpoint is stripped of surrounding whitespace, since one read from a file or
-    a shell often arrives with a trailing newline. Argus ships no default
-    endpoint, and this is kept out of the exporter class so the rules can be
-    exercised without the optional OTLP dependency. See ``docs/design-notes.md``
-    ("No default OTLP endpoint").
+    endpoint is stripped of surrounding whitespace. Argus ships no default, and
+    this is kept out of the exporter class so the rules can be tested without the
+    optional OTLP dependency. See ``docs/design-notes.md`` ("No default OTLP
+    endpoint").
 
     Raises:
-        ValueError: If ``endpoint`` is given but blank -- which reads as an
-            endpoint that failed to resolve, not as "use the environment" -- or if
-            it is omitted and neither environment variable is set.
+        ValueError: If ``endpoint`` is given but blank (which reads as failed to
+            resolve, not "use the environment"), or if it is omitted and neither
+            environment variable is set.
     """
     if endpoint is not None:
         endpoint = endpoint.strip()
@@ -120,20 +119,17 @@ def _resolve_auth_headers(
 
     An explicit ``api_key`` wins over the ``AEGIS_API_KEY`` environment
     variable, and any ``headers`` given are merged around the resolved
-    ``Authorization: Bearer <key>`` rather than replacing it. A key is
-    mandatory. See ``docs/design-notes.md`` ("Credentials resolved at
-    construction").
+    ``Authorization: Bearer <key>`` rather than replacing it. A key is mandatory.
+    See ``docs/design-notes.md`` ("Credentials resolved at construction").
 
     Returns:
         The headers to hand the transport -- the caller's, plus the bearer
         credential.
 
     Raises:
-        ValueError: If no key is resolvable; if the resolved key contains
-            whitespace (Aegis splits the header on whitespace, so such a key can
-            only ever come back as an opaque 401); or if ``headers`` already
-            carries an ``Authorization`` entry, which the key would silently
-            overwrite.
+        ValueError: If no key is resolvable, if the resolved key contains
+            whitespace, or if ``headers`` already carries an ``Authorization``
+            entry.
     """
     resolved = (
         api_key if api_key is not None else os.environ.get(_API_KEY_ENV_VAR)
@@ -233,10 +229,9 @@ class BufferedOTLPExporter(_DeferredExporter):
                 ``Authorization: Bearer <key>``. Required; falls back to the
                 ``AEGIS_API_KEY`` env var (see :func:`_resolve_auth_headers`).
             headers: Extra HTTP headers sent alongside the credential (e.g.
-                routing or tenant hints). This is the only way to add headers:
-                the transport's ``OTEL_EXPORTER_OTLP_*_HEADERS`` env vars never
-                take effect, because Argus always passes headers explicitly to
-                carry the credential.
+                routing or tenant hints). The only way to add headers: the
+                transport's ``OTEL_EXPORTER_OTLP_*_HEADERS`` env vars never take
+                effect, since Argus always passes headers to carry the credential.
             timeout: Per-export timeout in seconds; falls back to the
                 transport's own default when omitted.
 
@@ -265,13 +260,11 @@ class BufferedOTLPExporter(_DeferredExporter):
                 than from a run-level flag, so it is not encoded separately.
 
         Returns:
-            :attr:`Delivery.CONSUMED` once the backend has confirmed the batch,
-            so accepted spans are never POSTed twice; :attr:`Delivery.RETAINED`
-            after a failed attempt, leaving the spans for a later emit to retry.
-            A failure warns rather than raising (see ``docs/design-notes.md``,
-            "Delivery failures warn, never raise"), and both failure shapes are
-            handled: the transport reports a rejected batch by return value,
-            while a connection error can escape as an exception.
+            :attr:`Delivery.CONSUMED` once the backend confirms the batch, so
+            accepted spans are never POSTed twice; :attr:`Delivery.RETAINED`
+            after a failure, which warns rather than raising and leaves the spans
+            for a later emit to retry. See ``docs/design-notes.md`` ("Delivery
+            failures warn, never raise").
         """
         try:
             result = self._transport.export(spans)

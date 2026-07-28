@@ -183,10 +183,8 @@ class TestSpanLimits:
 
         session = argus.init("proj", exporters=[recording_exporter])
 
-        # A private OTel attribute on purpose: it pins the exact ceiling the
-        # provider was built with, which the behavioral test below cannot (that
-        # one only proves the ceiling is somewhere above 200). Should an SDK
-        # upgrade rename it, this failing is the warning to recheck the wiring.
+        # A private OTel attribute on purpose: it pins the exact ceiling, which
+        # the behavioral test cannot. A rename here is the warning to recheck.
         assert session.provider._span_limits.max_span_attributes == self.DEFAULT
 
     def test_provider_retains_attributes_past_otel_default(
