@@ -54,10 +54,11 @@ class OtlpConfig:
 
     Attributes:
         endpoint: Full URL to POST spans to, used verbatim. Omit it to read the
-            standard OTel endpoint env vars (see :func:`_resolve_endpoint`).
+            standard OTel endpoint env vars (see ``README.md``, "Remote export
+            over OTLP", for the resolution order).
         api_key: Key authenticating the export, sent as
             ``Authorization: Bearer <key>``. Omit it to read ``AEGIS_API_KEY``
-            (see :func:`_resolve_auth_headers`).
+            (see ``README.md``, "Authentication").
         headers: Extra HTTP headers sent alongside the credential.
         timeout: Per-export timeout in seconds; the transport's own default
             applies when omitted.
@@ -222,12 +223,15 @@ class BufferedOTLPExporter(_DeferredExporter):
         :func:`argus.init` passes through.
 
         Args:
-            endpoint: Full URL to POST spans to, used verbatim -- no
-                ``/v1/traces`` path is appended. When omitted, falls back to the
-                standard OTel endpoint env vars (see :func:`_resolve_endpoint`).
+            endpoint: Full URL to POST spans to. An explicit value is used
+                verbatim -- no ``/v1/traces`` path is appended. When omitted,
+                falls back to the standard OTel endpoint env vars, where the
+                all-signals ``OTEL_EXPORTER_OTLP_ENDPOINT`` *does* get
+                ``/v1/traces`` appended (see ``README.md``, "Remote export over
+                OTLP", for the resolution order).
             api_key: Key authenticating the export, sent as
                 ``Authorization: Bearer <key>``. Required; falls back to the
-                ``AEGIS_API_KEY`` env var (see :func:`_resolve_auth_headers`).
+                ``AEGIS_API_KEY`` env var (see ``README.md``, "Authentication").
             headers: Extra HTTP headers sent alongside the credential (e.g.
                 routing or tenant hints). The only way to add headers: the
                 transport's ``OTEL_EXPORTER_OTLP_*_HEADERS`` env vars never take
@@ -237,9 +241,8 @@ class BufferedOTLPExporter(_DeferredExporter):
 
         Raises:
             ValueError: If ``endpoint`` is blank, or is omitted with neither
-                endpoint env var set (see :func:`_resolve_endpoint`), or if the
-                API key is missing or unusable (see
-                :func:`_resolve_auth_headers`).
+                endpoint env var set, or if the API key is missing or unusable
+                (a blank value, or one containing whitespace).
             ImportError: If the optional ``otlp`` extra is not installed.
         """
         super().__init__()

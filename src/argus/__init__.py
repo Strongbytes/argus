@@ -3,8 +3,9 @@
 Argus is the all-seeing companion to Aegis: it watches what your agents do and
 records it. A single :func:`init` call detects the agent framework in use, turns
 on the matching OpenInference instrumentor(s), and persists each run's spans to
-disk as both canonical OTLP/JSON and a human-readable rendering -- or ships them
-to a remote backend over OTLP/HTTP with ``otlp=True``::
+disk as both canonical OTLP/JSON and a human-readable rendering -- and can also
+ship them to a remote backend over OTLP/HTTP, alongside the files, with
+``otlp=True``::
 
     import argus
     argus.init("my_project_name")  # auto-detects the framework, flushes on exit

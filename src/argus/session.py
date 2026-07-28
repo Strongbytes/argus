@@ -472,7 +472,8 @@ def init(
     """Configure tracing and turn on the right instrumentor(s).
 
     The nearest ``.env`` at or above the working directory is loaded before
-    anything is resolved (see :func:`_load_dotenv`). Calling ``init`` more than
+    anything is resolved (see ``docs/design-notes.md``, "Loading .env
+    unconditionally"). Calling ``init`` more than
     once in a process warns and returns the already-active :class:`Session`
     unchanged; call :func:`reset` first to genuinely reconfigure. Auto-detection
     (or ``instrument="all"``) finding no instrumentors likewise warns rather
