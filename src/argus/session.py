@@ -17,26 +17,16 @@ of the provider's atexit shutdown") for why it is built this way.
 from __future__ import annotations
 
 import atexit
-import os
 import sys
 import warnings
+from collections.abc import Sequence
 from pathlib import Path
 from types import TracebackType
-from typing import (
-    List,
-    Literal,
-    Optional,
-    Sequence,
-    Set,
-    Tuple,
-    Type,
-    Union,
-)
+from typing import Literal
 
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import (
     ReadableSpan,
-    SpanLimits,
     SpanProcessor,
     TracerProvider,
 )
@@ -52,83 +42,18 @@ from .detection import (
 from .exporters.base import BufferedSpanExporter
 from .exporters.file import FileSpanExporter
 from .exporters.otlp import BufferedOTLPExporter, OtlpConfig
+from .limits import _resolve_span_limits
 from .paths import default_traces_dir, detect_script_name
 
-# OpenTelemetry caps span attributes at 128, low enough that a long agent
-# conversation silently loses the model's final output. Argus raises the ceiling
-# far past any realistic run, deliberately without an ``init`` argument, leaving
-# the standard OTel env vars as the escape hatch. See ``docs/design-notes.md``
-# ("The raised span-attribute ceiling").
-_DEFAULT_MAX_SPAN_ATTRIBUTES = 50_000
-_SPAN_ATTRIBUTE_COUNT_ENV_VAR = "OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT"
-_ATTRIBUTE_COUNT_ENV_VAR = "OTEL_ATTRIBUTE_COUNT_LIMIT"
-# "No ceiling at all", which is what the standard variables mean when set to
-# nothing and what OpenTelemetry wants passed for it: given explicitly, ``UNSET``
-# short-circuits its own env resolution and lands as ``None`` on the limits. It
-# is negative, and a negative ceiling is never accepted from the environment,
-# which is what keeps it distinguishable from a real cap below.
-_UNLIMITED = SpanLimits.UNSET
-
-
-def _attribute_cap_from_env(
-    env_var: str, *, empty_means_unlimited: bool
-) -> Optional[int]:
-    """Read an attribute-count ceiling from ``env_var``.
-
-    Args:
-        env_var: Name of the environment variable to read.
-        empty_means_unlimited: How to read a variable set to nothing, mirroring
-            OpenTelemetry's own split between the two variables.
-
-    Returns:
-        The ceiling the variable asks for, :data:`_UNLIMITED` for no ceiling at
-        all, or ``None`` when it supplies nothing usable -- unset, malformed or
-        negative -- so the caller falls through to the next source.
-    """
-    raw = os.environ.get(env_var)
-    if raw is None:
-        return None
-    raw = raw.strip()
-    if raw == "":
-        return _UNLIMITED if empty_means_unlimited else None
-    try:
-        cap = int(raw)
-    except ValueError:
-        return None
-    return cap if cap >= 0 else None
-
-
-def _resolve_span_limits() -> SpanLimits:
-    """Build span limits that raise the attribute ceiling past OTel's default.
-
-    The standard environment variables win, in OpenTelemetry's own precedence:
-    ``OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT`` first, then the generic
-    ``OTEL_ATTRIBUTE_COUNT_LIMIT``; Argus's raised default applies only when
-    neither is usable. Only the span attribute *count* is touched -- every other
-    limit keeps whatever OpenTelemetry resolves for it. See
-    ``docs/design-notes.md`` ("The raised span-attribute ceiling").
-    """
-    cap = _attribute_cap_from_env(
-        _SPAN_ATTRIBUTE_COUNT_ENV_VAR, empty_means_unlimited=True
-    )
-    if cap is None:
-        cap = _attribute_cap_from_env(
-            _ATTRIBUTE_COUNT_ENV_VAR, empty_means_unlimited=False
-        )
-    if cap is None:
-        cap = _DEFAULT_MAX_SPAN_ATTRIBUTES
-    return SpanLimits(max_span_attributes=cap)
-
-
 # The single session for this process; ``init`` enforces the singleton.
-_session: "Optional[Session]" = None
+_session: Session | None = None
 # Flipped by our excepthook when the run dies with an unhandled exception, so
 # the atexit flush can tag the trace as a failure.
 _run_failed = False
 _excepthook_installed = False
 
 
-def _warn_reinit(existing: "Session", project: str) -> None:
+def _warn_reinit(existing: Session, project: str) -> None:
     """Warn that Argus is already initialized and this call is being ignored.
 
     Emitted as a :class:`RuntimeWarning` rather than raised, so a stray second
@@ -187,9 +112,9 @@ def _install_excepthook() -> None:
     previous = sys.excepthook
 
     def hook(
-        exc_type: Type[BaseException],
+        exc_type: type[BaseException],
         exc: BaseException,
-        tb: Optional[TracebackType],
+        tb: TracebackType | None,
     ) -> None:
         global _run_failed
         _run_failed = True
@@ -200,8 +125,8 @@ def _install_excepthook() -> None:
 
 
 def _resolve_otlp_config(
-    otlp: Union[bool, OtlpConfig, None],
-) -> Optional[OtlpConfig]:
+    otlp: bool | OtlpConfig | None,
+) -> OtlpConfig | None:
     """Normalize :func:`init`'s ``otlp`` argument to a config, or ``None`` for off.
 
     Args:
@@ -251,7 +176,7 @@ def _load_dotenv() -> None:
     load_dotenv(find_dotenv(usecwd=True))
 
 
-def _build_resource(project: str, service: Optional[str]) -> Resource:
+def _build_resource(project: str, service: str | None) -> Resource:
     """Build the attributes stamped on every span the run produces.
 
     ``service.name`` (OTel convention) identifies the observed app,
@@ -274,10 +199,10 @@ def _build_resource(project: str, service: Optional[str]) -> Resource:
 
 
 def _build_sinks(
-    exporters: Optional[Sequence[SpanExporter]],
-    output_dir: Union[str, Path, None],
-    otlp_config: Optional[OtlpConfig],
-) -> List[SpanExporter]:
+    exporters: Sequence[SpanExporter] | None,
+    output_dir: str | Path | None,
+    otlp_config: OtlpConfig | None,
+) -> list[SpanExporter]:
     """Decide which exporters the run writes through, in the order they see spans.
 
     Args:
@@ -292,7 +217,7 @@ def _build_sinks(
     Returns:
         The sinks to attach to the provider.
     """
-    sinks: List[SpanExporter]
+    sinks: list[SpanExporter]
     if exporters is None:
         base_dir = (
             Path(output_dir) if output_dir is not None else default_traces_dir()
@@ -394,13 +319,13 @@ class Session:
                 "finished".
         """
         self._provider = provider
-        self._exporters: List[SpanExporter] = list(exporters)
-        self._instrumentors: List[Instrumentor] = list(instrumentors)
+        self._exporters: list[SpanExporter] = list(exporters)
+        self._instrumentors: list[Instrumentor] = list(instrumentors)
         self._project = project
         self._span_counter = span_counter
         self._flushed = False
         self._flushed_at_count = 0
-        self._reported_failures: Set[Tuple[int, str]] = set()
+        self._reported_failures: set[tuple[int, str]] = set()
 
     @property
     def provider(self) -> TracerProvider:
@@ -420,7 +345,7 @@ class Session:
         return self._project
 
     @property
-    def exporters(self) -> Tuple[SpanExporter, ...]:
+    def exporters(self) -> tuple[SpanExporter, ...]:
         """The sinks :meth:`flush` drives, in the order they see spans.
 
         A tuple, and rebuilt on each access, so it answers "which sinks did
@@ -429,7 +354,7 @@ class Session:
         return tuple(self._exporters)
 
     @property
-    def instruments(self) -> Tuple[str, ...]:
+    def instruments(self) -> tuple[str, ...]:
         """Class names of the instrumentors ``init`` turned on.
 
         Derived on access rather than stored, so it cannot fall out of step
@@ -437,12 +362,8 @@ class Session:
         """
         return tuple(type(i).__name__ for i in self._instrumentors)
 
-    def flush(self, *, failed: Optional[bool] = None) -> None:
+    def flush(self, *, failed: bool | None = None) -> None:
         """Emit every exporter's buffered traces.
-
-        Args:
-            failed: Overrides the auto-detected outcome; when omitted the
-                process-wide flag set by our excepthook is used.
 
         An exporter implementing
         :class:`~argus.exporters.base.BufferedSpanExporter` is driven through
@@ -451,6 +372,10 @@ class Session:
         returns immediately, while spans produced *after* a flush are emitted by
         the next one. See ``docs/design-notes.md`` ("A flush is not terminal",
         "Exporters Argus does not own").
+
+        Args:
+            failed: Overrides the auto-detected outcome; when omitted the
+                process-wide flag set by our excepthook is used.
         """
         if self._flushed and self._span_counter.count == self._flushed_at_count:
             return
@@ -526,15 +451,15 @@ class Session:
             stacklevel=3,
         )
 
-    def __enter__(self) -> "Session":
+    def __enter__(self) -> Session:
         """Enter the context manager, returning the session itself."""
         return self
 
     def __exit__(
         self,
-        exc_type: Optional[Type[BaseException]],
-        exc: Optional[BaseException],
-        tb: Optional[TracebackType],
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
     ) -> Literal[False]:
         """Flush on scope exit, tagging failure if the block raised.
 
@@ -549,13 +474,22 @@ class Session:
 def init(
     project: str,
     *,
-    service: Optional[str] = None,
+    service: str | None = None,
     instrument: InstrumentSelection = None,
-    output_dir: Union[str, Path, None] = None,
-    exporters: Optional[Sequence[SpanExporter]] = None,
-    otlp: Union[bool, OtlpConfig, None] = None,
+    output_dir: str | Path | None = None,
+    exporters: Sequence[SpanExporter] | None = None,
+    otlp: bool | OtlpConfig | None = None,
 ) -> Session:
     """Configure tracing and turn on the right instrumentor(s).
+
+    The nearest ``.env`` at or above the working directory is loaded before
+    anything is resolved (see :func:`_load_dotenv`). Calling ``init`` more than
+    once in a process warns and returns the already-active :class:`Session`
+    unchanged; call :func:`reset` first to genuinely reconfigure. Auto-detection
+    (or ``instrument="all"``) finding no instrumentors likewise warns rather
+    than silently tracing nothing; pass ``instrument=[]`` to opt out
+    deliberately. See ``docs/design-notes.md`` ("One session per process",
+    "Curated detection over entry points").
 
     Args:
         project: Argus's logical run umbrella, stamped on every span as
@@ -607,15 +541,6 @@ def init(
             not installed. Like the endpoint and key, this surfaces here rather
             than at exit with the run's whole trace already buffered (see
             ``docs/design-notes.md``, "No default OTLP endpoint").
-
-    The nearest ``.env`` at or above the working directory is loaded before
-    anything is resolved (see :func:`_load_dotenv`). Calling ``init`` more than
-    once in a process warns and returns the already-active :class:`Session`
-    unchanged; call :func:`reset` first to genuinely reconfigure. Auto-detection
-    (or ``instrument="all"``) finding no instrumentors likewise warns rather
-    than silently tracing nothing; pass ``instrument=[]`` to opt out
-    deliberately. See ``docs/design-notes.md`` ("One session per process",
-    "Curated detection over entry points").
     """
     global _session
     if _session is not None:

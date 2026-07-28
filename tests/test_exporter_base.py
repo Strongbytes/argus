@@ -1,6 +1,6 @@
 """Tests for the shared buffered-exporter contract in :mod:`argus.exporters.base`.
 
-Both built-in sinks are built on ``_BufferedExporter``, so what is exercised here
+Both built-in sinks are built on ``_DeferredExporter``, so what is exercised here
 is what neither exporter's own tests should have to re-prove: spans accumulate in
 ``export``, ``emit`` hands the whole buffer over, and the buffer is kept or
 dropped according to what ``_deliver`` reports. That last decision is the one
@@ -10,17 +10,17 @@ from drifting apart.
 
 from __future__ import annotations
 
-from typing import Any, List, Tuple
+from typing import Any
 
 from opentelemetry.sdk.trace.export import SpanExportResult
 
 from argus.exporters import BufferedSpanExporter, Delivery, FileSpanExporter
-from argus.exporters.base import _BufferedExporter
+from argus.exporters.base import _DeferredExporter
 
 from tests.factories import PlainSpanExporter, make_span
 
 
-class _Sink(_BufferedExporter):
+class _Sink(_DeferredExporter):
     """A minimal sink recording each delivery, with configurable consumption.
 
     ``outcome`` is what ``_deliver`` reports back: :attr:`Delivery.CONSUMED` for
@@ -32,7 +32,7 @@ class _Sink(_BufferedExporter):
     def __init__(self, outcome: Delivery = Delivery.CONSUMED) -> None:
         super().__init__()
         self.outcome = outcome
-        self.deliveries: List[Tuple[List[Any], bool]] = []
+        self.deliveries: list[tuple[list[Any], bool]] = []
 
     def _deliver(self, spans, *, failed):
         self.deliveries.append((list(spans), failed))

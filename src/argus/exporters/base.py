@@ -4,7 +4,7 @@ Argus's own sinks -- and any exporter a caller writes -- opt into a deferred
 lifecycle: spans are buffered as they end and the real work happens in an
 ``emit(failed=...)`` call Argus drives on flush.
 :class:`BufferedSpanExporter` is that contract as a type;
-:class:`_BufferedExporter` is the skeleton both built-in sinks share.
+:class:`_DeferredExporter` is the skeleton both built-in sinks share.
 
 See ``docs/design-notes.md`` ("Buffer now, emit once", "Repeat emits: rewrite or
 clear") for why the lifecycle is shaped this way.
@@ -12,15 +12,16 @@ clear") for why the lifecycle is shaped this way.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from enum import Enum, auto
-from typing import List, Protocol, Sequence, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 
 
 class Delivery(Enum):
-    """Whether a :meth:`_BufferedExporter._deliver` call consumed its spans.
+    """Whether a :meth:`_DeferredExporter._deliver` call consumed its spans.
 
     The one decision a buffered-sink subclass makes: clear the buffer so the
     same spans are never delivered again, or keep them for a rewrite / retry.
@@ -56,7 +57,7 @@ class BufferedSpanExporter(Protocol):
         ...
 
 
-class _BufferedExporter(SpanExporter):
+class _DeferredExporter(SpanExporter):
     """Skeleton for a sink that buffers spans and emits them on demand.
 
     Holds the buffer, satisfies the parts of the
@@ -68,7 +69,7 @@ class _BufferedExporter(SpanExporter):
     """
 
     def __init__(self) -> None:
-        self._spans: List[ReadableSpan] = []
+        self._spans: list[ReadableSpan] = []
 
     def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
         """Buffer a batch of finished spans; nothing is written or sent yet.
@@ -93,7 +94,7 @@ class _BufferedExporter(SpanExporter):
         if self._deliver(list(self._spans), failed=failed) is Delivery.CONSUMED:
             self._spans = []
 
-    def _deliver(self, spans: List[ReadableSpan], *, failed: bool) -> Delivery:
+    def _deliver(self, spans: list[ReadableSpan], *, failed: bool) -> Delivery:
         """Write or send ``spans``; return whether they may leave the buffer.
 
         Args:

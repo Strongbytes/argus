@@ -24,7 +24,7 @@ import json
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Literal
 
 from google.protobuf.json_format import MessageToDict
 from opentelemetry.exporter.otlp.proto.common.trace_encoder import encode_spans
@@ -32,7 +32,7 @@ from opentelemetry.sdk.trace import ReadableSpan
 
 from ..json_utils import expand_embedded_json
 from ..paths import default_traces_dir, detect_script_name
-from .base import Delivery, _BufferedExporter
+from .base import Delivery, _DeferredExporter
 
 #: Which of a trace's two files is meant; also the file's own format marker.
 TraceFormat = Literal["otlp", "readable"]
@@ -47,7 +47,7 @@ def trace_filename(
     trace_format: TraceFormat,
     *,
     failed: bool = False,
-    timestamp: Optional[datetime] = None,
+    timestamp: datetime | None = None,
     sequence: int = 0,
 ) -> str:
     """Return the file name a trace is written under.
@@ -128,13 +128,13 @@ def _hex_encode_ids(node: Any) -> Any:
     return node
 
 
-class FileSpanExporter(_BufferedExporter):
+class FileSpanExporter(_DeferredExporter):
     """Persist spans to disk, one OTLP/JSON and one readable file per trace."""
 
     def __init__(
         self,
-        base_dir: Union[str, Path, None] = None,
-        script_name: Optional[str] = None,
+        base_dir: str | Path | None = None,
+        script_name: str | None = None,
     ) -> None:
         """Prepare an exporter that writes traces under ``base_dir``.
 
@@ -155,7 +155,7 @@ class FileSpanExporter(_BufferedExporter):
         )
         self._base_dir.mkdir(parents=True, exist_ok=True)
         self._script_name = script_name or detect_script_name()
-        self._naming_by_trace: Dict[int, _TraceNaming] = {}
+        self._naming_by_trace: dict[int, _TraceNaming] = {}
 
     def _naming_for(self, trace_id: int, failed: bool) -> _TraceNaming:
         """Return ``trace_id``'s naming, allocating it on first write.
@@ -186,18 +186,18 @@ class FileSpanExporter(_BufferedExporter):
 
     @staticmethod
     def _group_by_trace(
-        spans: List[ReadableSpan],
-    ) -> Dict[int, List[ReadableSpan]]:
+        spans: list[ReadableSpan],
+    ) -> dict[int, list[ReadableSpan]]:
         """Return ``spans`` bucketed by trace id, each bucket in arrival order."""
-        traces: Dict[int, List[ReadableSpan]] = {}
+        traces: dict[int, list[ReadableSpan]] = {}
         for span in spans:
             traces.setdefault(span.context.trace_id, []).append(span)
         return traces
 
     @staticmethod
     def _in_generation_order(
-        spans: List[ReadableSpan],
-    ) -> List[ReadableSpan]:
+        spans: list[ReadableSpan],
+    ) -> list[ReadableSpan]:
         """Return ``spans`` ordered by when each was generated (started).
 
         Spans arrive in end-time order, so this restores the run's chronology.
@@ -214,7 +214,7 @@ class FileSpanExporter(_BufferedExporter):
             handle.write("\n")
 
     @staticmethod
-    def _to_readable(spans: List[ReadableSpan]) -> List[Dict[str, Any]]:
+    def _to_readable(spans: list[ReadableSpan]) -> list[dict[str, Any]]:
         """Render ordered spans to the human-readable JSON shape.
 
         Each span goes through OpenTelemetry's own ``to_json`` and then
@@ -226,7 +226,7 @@ class FileSpanExporter(_BufferedExporter):
             for span in spans
         ]
 
-    def _deliver(self, spans: List[ReadableSpan], *, failed: bool) -> Delivery:
+    def _deliver(self, spans: list[ReadableSpan], *, failed: bool) -> Delivery:
         """Write each buffered trace's pair of files, keeping the buffer.
 
         Args:

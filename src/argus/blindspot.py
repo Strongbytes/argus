@@ -28,9 +28,10 @@ from __future__ import annotations
 
 import functools
 import inspect
+from collections.abc import Callable
 from contextvars import ContextVar
 from types import TracebackType
-from typing import Any, Callable, Literal, Optional, Tuple, Type, TypeVar
+from typing import Any, Literal, TypeVar
 
 from opentelemetry.context import (
     _SUPPRESS_INSTRUMENTATION_KEY,
@@ -48,7 +49,7 @@ F = TypeVar("F", bound=Callable[..., Any])
 # task, like the suppression it undoes: a token can only be detached from the
 # context it was attached in, so an instance shared across threads or tasks must
 # not let one of them pop another's token.
-_open_tokens: ContextVar[Tuple[Token[Context], ...]] = ContextVar(
+_open_tokens: ContextVar[tuple[Token[Context], ...]] = ContextVar(
     "argus_blindspot_tokens", default=()
 )
 
@@ -97,7 +98,7 @@ class blindspot:
     invocations never interfere.
     """
 
-    def _enter(self) -> "blindspot":
+    def _enter(self) -> blindspot:
         """Attach the suppression flag and remember the token to undo it."""
         token = attach(set_value(_SUPPRESS_INSTRUMENTATION_KEY, True))
         _open_tokens.set(_open_tokens.get() + (token,))
@@ -110,15 +111,15 @@ class blindspot:
             _open_tokens.set(open_tokens[:-1])
             detach(open_tokens[-1])
 
-    def __enter__(self) -> "blindspot":
+    def __enter__(self) -> blindspot:
         """Begin a synchronous blindspot."""
         return self._enter()
 
     def __exit__(
         self,
-        exc_type: Optional[Type[BaseException]],
-        exc: Optional[BaseException],
-        tb: Optional[TracebackType],
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
     ) -> Literal[False]:
         """End the blindspot, restoring tracing even if the block raised.
 
@@ -129,15 +130,15 @@ class blindspot:
         self._exit()
         return False
 
-    async def __aenter__(self) -> "blindspot":
+    async def __aenter__(self) -> blindspot:
         """Begin an asynchronous blindspot (``async with``)."""
         return self._enter()
 
     async def __aexit__(
         self,
-        exc_type: Optional[Type[BaseException]],
-        exc: Optional[BaseException],
-        tb: Optional[TracebackType],
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
     ) -> Literal[False]:
         """End an asynchronous blindspot, restoring tracing on exit."""
         self._exit()

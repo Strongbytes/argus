@@ -180,7 +180,7 @@ backend, whereas rewriting a file simply supersedes it. Since the buffer is
 cleared only on a *confirmed* success, a failed remote attempt leaves the spans
 intact for the next emit to retry.
 
-`_BufferedExporter` encodes this as the one decision a subclass makes — its
+`_DeferredExporter` encodes this as the one decision a subclass makes — its
 `_deliver` returns a `Delivery` outcome (`CONSUMED` or `RETAINED`) — so neither
 sink can get the buffer bookkeeping wrong, and a third-party sink cannot get the
 polarity backwards at the return statement.

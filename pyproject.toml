@@ -102,9 +102,11 @@ target-version = "py310"
 
 [tool.ruff.lint]
 # Pyflakes and pycodestyle for real mistakes, bugbear for the ones that look
-# deliberate, and flake8-unused-arguments for the dead parameter a refactor
-# leaves behind.
-select = ["E", "F", "W", "B", "ARG"]
+# deliberate, flake8-unused-arguments for the dead parameter a refactor leaves
+# behind, and pyupgrade to keep the annotations on the modern PEP 585/604
+# spellings (list[...] over List[...], X | None over Optional[X]) the codebase
+# standardized on rather than let them drift back to typing.List/Optional.
+select = ["E", "F", "W", "B", "ARG", "UP"]
 ignore = [
     # Line length is black's call. Black leaves a long string literal, URL or
     # comment alone rather than mangling it, so E501 would only ever nag about

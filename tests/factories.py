@@ -32,7 +32,8 @@ relies on:
 from __future__ import annotations
 
 import itertools
-from typing import Any, List, Optional, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import ReadableSpan
@@ -51,7 +52,7 @@ class FakeInstrumentor:
     """
 
     def __init__(self) -> None:
-        self.instrument_calls: List[Any] = []
+        self.instrument_calls: list[Any] = []
         self.uninstrument_count = 0
 
     def instrument(self, *, tracer_provider: Any = None, **_: Any) -> None:
@@ -86,7 +87,7 @@ class PlainSpanExporter(SpanExporter):
     """
 
     def __init__(self) -> None:
-        self.exported_spans: List[Any] = []
+        self.exported_spans: list[Any] = []
         self.force_flush_count = 0
         self.shutdown_count = 0
 
@@ -115,7 +116,7 @@ class RecordingExporter(PlainSpanExporter):
 
     def __init__(self) -> None:
         super().__init__()
-        self.emit_calls: List[bool] = []
+        self.emit_calls: list[bool] = []
 
     def emit(self, failed: bool = False) -> None:
         self.emit_calls.append(failed)
@@ -133,10 +134,10 @@ _TEST_SCOPE = InstrumentationScope("argus-tests")
 
 
 def make_span(
-    trace_id: Optional[int] = None,
+    trace_id: int | None = None,
     *,
     name: str = "span",
-    start_time: Optional[int] = None,
+    start_time: int | None = None,
     **attributes: Any,
 ) -> ReadableSpan:
     """Return a real :class:`ReadableSpan` the OTLP encoder can serialize.
@@ -168,14 +169,14 @@ def make_span(
 
 def patch_resolve_instrumentors(
     monkeypatch, instances: Sequence[Any]
-) -> List[Any]:
+) -> list[Any]:
     """Make :func:`argus.init` turn on ``instances`` instead of real detection.
 
     Patches the ``resolve_instrumentors`` name as imported into
     ``argus.session`` and returns the recorded ``instrument`` argument list so a
     test can assert what selection ``init`` requested.
     """
-    received: List[Any] = []
+    received: list[Any] = []
 
     def fake_resolve(instrument):
         received.append(instrument)

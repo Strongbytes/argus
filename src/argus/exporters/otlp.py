@@ -20,13 +20,13 @@ from __future__ import annotations
 
 import os
 import warnings
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import List, Mapping, Optional
 
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 
-from .base import Delivery, _BufferedExporter
+from .base import Delivery, _DeferredExporter
 
 # Standard OpenTelemetry env vars naming the endpoint. The traces-specific one is
 # a complete URL; the generic one is a base shared by every signal, to which the
@@ -63,13 +63,13 @@ class OtlpConfig:
             applies when omitted.
     """
 
-    endpoint: Optional[str] = None
-    api_key: Optional[str] = None
-    headers: Optional[Mapping[str, str]] = None
-    timeout: Optional[float] = None
+    endpoint: str | None = None
+    api_key: str | None = None
+    headers: Mapping[str, str] | None = None
+    timeout: float | None = None
 
 
-def _resolve_endpoint(endpoint: Optional[str]) -> str:
+def _resolve_endpoint(endpoint: str | None) -> str:
     """Decide the URL spans are POSTed to, most explicit source winning.
 
     Precedence follows OpenTelemetry's own: an explicit ``endpoint`` argument,
@@ -113,8 +113,8 @@ def _resolve_endpoint(endpoint: Optional[str]) -> str:
 
 
 def _resolve_auth_headers(
-    api_key: Optional[str],
-    headers: Optional[Mapping[str, str]],
+    api_key: str | None,
+    headers: Mapping[str, str] | None,
 ) -> Mapping[str, str]:
     """Turn an API key into the ``Authorization`` header the backend expects.
 
@@ -166,7 +166,7 @@ def _resolve_auth_headers(
 def _build_transport(
     endpoint: str,
     headers: Mapping[str, str],
-    timeout: Optional[float],
+    timeout: float | None,
 ) -> SpanExporter:
     """Construct the underlying OpenTelemetry OTLP/HTTP exporter.
 
@@ -196,7 +196,7 @@ def _build_transport(
     return OTLPSpanExporter(**kwargs)
 
 
-class BufferedOTLPExporter(_BufferedExporter):
+class BufferedOTLPExporter(_DeferredExporter):
     """Buffer spans and POST them to a backend in one OTLP/HTTP request on exit.
 
     The remote counterpart to :class:`~argus.exporters.file.FileSpanExporter`:
@@ -214,11 +214,11 @@ class BufferedOTLPExporter(_BufferedExporter):
 
     def __init__(
         self,
-        endpoint: Optional[str] = None,
+        endpoint: str | None = None,
         *,
-        api_key: Optional[str] = None,
-        headers: Optional[Mapping[str, str]] = None,
-        timeout: Optional[float] = None,
+        api_key: str | None = None,
+        headers: Mapping[str, str] | None = None,
+        timeout: float | None = None,
     ) -> None:
         """Prepare an exporter pointed at a backend ingest endpoint.
 
@@ -255,7 +255,7 @@ class BufferedOTLPExporter(_BufferedExporter):
             self._endpoint, _resolve_auth_headers(api_key, headers), timeout
         )
 
-    def _deliver(self, spans: List[ReadableSpan], *, failed: bool) -> Delivery:
+    def _deliver(self, spans: list[ReadableSpan], *, failed: bool) -> Delivery:
         """POST every buffered span to the endpoint in a single request.
 
         Args:

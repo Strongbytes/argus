@@ -13,19 +13,11 @@ Argus drives: the extension point for a framework it doesn't know about yet.
 from __future__ import annotations
 
 import sys
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from importlib import import_module
 from importlib.util import find_spec
-from typing import (
-    Any,
-    Iterable,
-    Literal,
-    Optional,
-    Protocol,
-    Sequence,
-    Union,
-    runtime_checkable,
-)
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from opentelemetry.trace import TracerProvider
 
@@ -52,7 +44,7 @@ class Instrumentor(Protocol):
     def instrument(
         self,
         *,
-        tracer_provider: Optional[TracerProvider] = None,
+        tracer_provider: TracerProvider | None = None,
         **kwargs: Any,
     ) -> None:
         """Patch the target framework to emit spans into ``tracer_provider``."""
@@ -77,9 +69,9 @@ InstrumentKey = Literal["openai_agents", "claude", "agno", "openai"]
 InstrumentStrategy = Literal["curated", "all"]
 
 #: Everything :func:`argus.init`'s ``instrument=`` accepts.
-InstrumentSelection = Union[
-    InstrumentKey, InstrumentStrategy, Sequence[InstrumentKey], None
-]
+InstrumentSelection = (
+    InstrumentKey | InstrumentStrategy | Sequence[InstrumentKey] | None
+)
 
 
 @dataclass(frozen=True)
