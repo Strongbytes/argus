@@ -36,12 +36,13 @@ ends in an unhandled exception is still captured, tagged with an `.error` marker
 before the format suffix (`..._<script>.error.otlp.json` and
 `..._<script>.error.readable.json`).
 
-The scheme in full -- including the numeric tiebreaker a trace gets when a
-sibling trace from the same run landed in the same second -- is one function,
-`argus.exporters.trace_filename`, if you need to reproduce or parse a name
-rather than read one. The tiebreaker is scoped to a single run: two processes
-writing to the same directory in the same second, under the same script name,
-can still overwrite each other's files.
+The naming scheme in full -- including the numeric tiebreaker for two traces
+from the same run and second -- is one function, `argus.exporters.trace_filename`,
+if you need to reproduce or parse a name rather than read one
+([recipe](docs/examples.md#reproducing-a-traces-file-name),
+[rationale](docs/design-notes.md#trace-filenames)). The tiebreaker is scoped to a
+single run, so two processes writing to the same directory, second, and script
+name can still overwrite each other's files.
 
 ## Documentation
 
@@ -172,11 +173,12 @@ with argus.init("my_project_name"):
     run_my_agent()
 ```
 
-A flush is not a point of no return. Leaving the `with` block writes what has
-been captured so far, but tracing stays on: spans produced by code that keeps
-running afterwards are emitted by the next flush, which the `atexit` hook always
-performs. Flushing twice with nothing new in between does no work, so the
-context manager and the automatic flush cost nothing together.
+A flush is not a point of no return: leaving the `with` block writes what has
+been captured so far, but tracing stays on and later spans are emitted by the
+next flush (the `atexit` hook always performs one). See
+[docs/examples.md](docs/examples.md#scoped-flushing-with-the-session) for the
+recipe and [the design notes](docs/design-notes.md#a-flush-is-not-terminal) for
+why repeat flushes are safe.
 
 ### The `Session` object
 
@@ -196,38 +198,28 @@ print(session.project)      # 'support-bot'
 print(session.instruments)  # ('OpenAIAgentsInstrumentor',)
 ```
 
-They report; they don't rewire. Argus drives the exporters and instrumentors on
-flush, on exit and on `reset`, and the provider already carries this session's
-span processors — so these are handed out to read, and none of them can be
-replaced. Appending to `session.exporters` wouldn't work either, which is why it
-is a tuple: a sink added after `init` gets driven on flush but never receives a
-span, so it would write an empty trace. To change what is recorded, call
-`argus.reset()` and `init` again. Everything else on the session — the
-constructor included — is Argus's own and may change between releases; the class
-is exported so you can annotate what `init` handed you.
+They report; they don't rewire. These are read-only (and `exporters` is a tuple)
+because Argus drives the sinks and instrumentors wired to *this* session -- a
+replacement or an appended sink would never receive spans. To change what is
+recorded, call `argus.reset()` and `init` again. The class is exported so you can
+annotate what `init` handed you; everything else on it, the constructor included,
+is Argus's own and may change between releases. Why the surface is drawn this way
+is in [the design notes](docs/design-notes.md#the-session-reports-it-does-not-rewire).
 
 ### Re-initializing in a notebook or REPL (`argus.reset()`)
 
 Argus is a per-process singleton: a second `argus.init(...)` warns and returns
 the first session unchanged, because instrumentors are global and a second
-provider could not reliably receive their spans. For a script that is what you
-want. For a notebook or a REPL it isn't -- re-running the `init` cell is how you
-change a setting -- so `argus.reset()` retires the active session and lets the
-next `init` configure everything afresh:
+provider could not reliably receive their spans. That is right for a script and
+wrong for a notebook, where re-running the `init` cell is how you change a
+setting. `argus.reset()` retires the active session so the next `init` configures
+everything afresh. It does **not** flush, and the `atexit` hook only flushes the
+_active_ session, so whatever the retired one had buffered is gone unless you
+flush it first.
 
-```python
-argus.reset()
-argus.init("my_project_name", otlp=True)
-```
-
-`reset` does **not** flush, and the `atexit` hook only flushes the _active_
-session -- so whatever the retired one had buffered is gone. Write it out first
-if you still want it:
-
-```python
-session.flush()    # the Session that init returned
-argus.reset()
-```
+See [docs/examples.md](docs/examples.md#notebooks-and-repls) for the recipe and
+[the design notes](docs/design-notes.md#one-session-per-process) for why the
+singleton exists.
 
 ### The span attribute ceiling
 
@@ -238,10 +230,10 @@ conversation crosses 128 mid-run -- and what gets evicted includes the model's
 final output message. `init` therefore raises the ceiling to **50,000**: far past
 any realistic run, while keeping a rail against a pathological one.
 
-It is deliberately not an `init` argument, since choosing the value well means
-knowing how OpenInference flattens messages and a too-low value fails silently.
-The standard OpenTelemetry variables are the escape hatch for the rare case that
-needs one, in OpenTelemetry's own precedence:
+It is deliberately not an `init` argument (the reasoning is in [the design
+notes](docs/design-notes.md#the-raised-span-attribute-ceiling)). The standard
+OpenTelemetry variables are the escape hatch for the rare case that needs one, in
+OpenTelemetry's own precedence:
 
 | Variable                          | Read as                                                                                                                    |
 | --------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
@@ -252,8 +244,6 @@ Argus's 50,000 applies only when neither variable gives a usable value, and
 anything that is not a non-negative integer counts as unusable and falls through
 to the next source. Only the attribute _count_ is raised: the limits on events,
 links, and attribute value lengths keep whatever OpenTelemetry resolves for them.
-Why the generic variable is honored at all -- and why this isn't an argument --
-is in [the design notes](docs/design-notes.md#the-raised-span-attribute-ceiling).
 
 ## Remote export over OTLP
 
@@ -271,18 +261,9 @@ Enabling `otlp` without that extra installed raises `ImportError` at your
 than at exit -- the same fail-early stance the endpoint and key below follow.
 
 ```python
-import argus
-
-# otlp=True reads the endpoint from the standard OTel env vars below and the
-# API key from AEGIS_API_KEY (and raises if either is unset -- there is no
-# default endpoint, and ingest is authenticated):
+# True reads the endpoint from the standard OTel env vars and the key from
+# AEGIS_API_KEY; an OtlpConfig(...) sets them (and headers/timeout) explicitly.
 argus.init("my_project_name", otlp=True)
-
-# Or configure it explicitly. OtlpConfig carries every remote setting:
-argus.init(
-    "my_project_name",
-    otlp=argus.OtlpConfig("http://localhost:9000/api/v1/trace/ingest"),
-)
 ```
 
 `otlp` is the only remote-export argument, and `OtlpConfig` holds all four
@@ -297,7 +278,8 @@ endpoint to use it:
 | `timeout`  | the transport's own    | Per-export timeout in seconds; otherwise `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` applies. |
 
 A bare `OtlpConfig()` therefore means the same thing as `otlp=True`. Pass `None`,
-or omit `otlp`, to keep remote export off.
+or omit `otlp`, to keep remote export off. For runnable setups -- `.env`, in-code
+config, both together -- see [docs/examples.md](docs/examples.md#remote-export-over-otlp).
 
 Argus ships **no default endpoint**: it's a library anyone can install, so
 rather than guess a target (and risk quietly shipping traces to the wrong
@@ -335,218 +317,101 @@ Remote export is authenticated with an Aegis API key, sent as an
 reaches your source -- `init` loads a `.env`, searching your working directory
 and then **each parent directory above it**, nearest one winning (so a script in
 a monorepo can pick up a key from a shared parent). Anything already set in the
-environment is left alone, so real deployment configuration always wins. That
-makes this enough on its own:
+environment is left alone, so real deployment configuration always wins, making
+this enough on its own:
 
 ```bash
 AEGIS_API_KEY=sk_...
 ```
 
-```python
-argus.init("my_project_name", otlp=True)   # key read from AEGIS_API_KEY
-```
-
-Pass it explicitly when it comes from somewhere else, like a secrets manager:
-
-```python
-argus.init("my_project_name", otlp=argus.OtlpConfig(api_key=fetch_secret("aegis")))
-```
+Pass it explicitly -- `OtlpConfig(api_key=...)` -- when it comes from somewhere
+else, like a secrets manager.
 
 The key is **required** whenever `otlp` is on, and it is resolved and checked
-when `init` runs, so a missing or malformed key raises `ValueError` right at
-your `argus.init(...)` line. That is deliberate: because spans are buffered and
-POSTed once on exit, a credential rejected at send time would surface as a
-warning during interpreter shutdown -- with the run over and the whole trace
-already gone. There is no unauthenticated remote export; the local trace files
-are always written regardless.
+when `init` runs, so a missing or malformed key raises `ValueError` right at your
+`argus.init(...)` line rather than during interpreter shutdown with the run's
+whole trace already gone. There is no unauthenticated remote export; the local
+trace files are always written regardless. Why the check happens at construction
+is in [the design notes](docs/design-notes.md#credentials-resolved-at-construction).
 
 The OTLP exporter follows the same lifecycle as the file exporter: it **buffers
-spans in memory and POSTs the whole run once, on exit** (not streamed mid-run),
-so the backend is hit a single time per run instead of absorbing a trickle of
-batches. The trade-off is identical to the file sink's -- a hard kill before exit
-loses the trace, since nothing was sent yet -- and a run's failure is carried on
-each span's own status rather than in a filename. Spans the backend has accepted
-are dropped from the buffer, so a program that flushes mid-run and keeps going
-sends only the new spans in its next request, never a duplicate.
+spans and POSTs the whole run once, on exit**, not streamed mid-run. Accepted
+spans leave the buffer, so a mid-run flush never re-sends them. The trade-offs --
+and why the remote sink mirrors the file sink rather than streaming -- are in
+[the design notes](docs/design-notes.md#buffer-now-emit-once).
 
-A customized remote sink stays a one-argument decision, because `OtlpConfig`
-carries the headers and timeout too -- and it still runs alongside the trace
-files. Authentication comes from `api_key`/`AEGIS_API_KEY` either way; an
-`Authorization` entry in `headers` is rejected rather than silently overwritten:
-
-```python
-from argus import OtlpConfig
-
-argus.init(
-    "my_project_name",
-    otlp=OtlpConfig(
-        "http://localhost:9000/api/v1/trace/ingest",
-        api_key="sk_…",              # or leave it to AEGIS_API_KEY
-        headers={"x-tenant": "acme"},
-        timeout=10,
-    ),
-)
-```
+A customized remote sink stays a one-argument decision: `OtlpConfig` carries the
+headers and timeout too, so an `OtlpConfig(headers=..., timeout=...)` still runs
+alongside the trace files. Authentication comes from `api_key`/`AEGIS_API_KEY`
+either way, and an `Authorization` entry in `headers` is rejected rather than
+silently overwritten.
 
 For anything beyond those four settings -- compression, a shared HTTP session --
 construct the exporter yourself and pass it through `exporters=`. It is named
 `BufferedOTLPExporter` rather than `OTLPSpanExporter` so it doesn't shadow
-OpenTelemetry's streaming exporter of that name. Since `exporters=` replaces the
-default sink, name the file one too when you want both:
-
-```python
-from argus import FileSpanExporter
-from argus.exporters import BufferedOTLPExporter
-
-argus.init(
-    "my_project_name",
-    exporters=[
-        FileSpanExporter(),
-        BufferedOTLPExporter(
-            "http://localhost:9000/api/v1/trace/ingest",
-            timeout=10,
-        ),
-    ],
-)
-```
+OpenTelemetry's streaming exporter of that name
+([why](docs/design-notes.md#names-that-dont-shadow-opentelemetrys)); since
+`exporters=` replaces the default sink, name the file one alongside it when you
+want both. See
+[docs/examples.md](docs/examples.md#trace-files-and-a-remote-backend-together)
+for the runnable form.
 
 ## Custom exporters
 
 `exporters=` accepts any OpenTelemetry `SpanExporter`, and how Argus drives it
-depends on whether it opts into the deferred lifecycle.
+depends on whether it opts into the deferred lifecycle:
 
-A plain `SpanExporter` needs nothing special. Spans are handed to its `export`
-method synchronously as they end, Argus calls `force_flush()` on each flush
-that has new spans to drain, and `shutdown()` once at process exit:
+- A **plain `SpanExporter`** needs nothing special. Spans reach its `export`
+  method synchronously as they end; Argus calls `force_flush()` on each flush
+  with new spans to drain and `shutdown()` once at process exit.
+- One that also defines **`emit(failed: bool)`** satisfies Argus's
+  `BufferedSpanExporter` protocol and opts into the buffer-now, write-once
+  lifecycle Argus's own two sinks use. Argus then calls `emit` instead of
+  `force_flush`, passing whether the run ended in an unhandled exception -- which
+  is what lets the file exporter tag a failed run in its filename.
 
-```python
-from opentelemetry.sdk.trace.export import ConsoleSpanExporter
-
-argus.init("my_project_name", exporters=[ConsoleSpanExporter()])
-```
-
-An exporter that also defines `emit(failed: bool)` satisfies Argus's
-`BufferedSpanExporter` protocol and opts into the buffer-now, write-once
-lifecycle its own two sinks use. Argus then calls `emit` instead of
-`force_flush`, passing whether the run ended in an unhandled exception -- which
-is what lets the file exporter tag a failed run in its filename. Buffer in
-`export`, do the real work in `emit`:
-
-```python
-from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
-
-class SummaryExporter(SpanExporter):
-    def __init__(self):
-        self._spans = []
-
-    def export(self, spans):
-        self._spans.extend(spans)      # buffer only; nothing leaves yet
-        return SpanExportResult.SUCCESS
-
-    def emit(self, failed: bool = False):
-        verdict = "failed" if failed else "ok"
-        print(f"{len(self._spans)} spans, run {verdict}")
-        self._spans = []
-
-    def force_flush(self, timeout_millis: int = 30_000) -> bool:
-        return True
-
-    def shutdown(self) -> None:
-        pass
-```
-
-`BufferedSpanExporter` is a runtime-checkable `typing.Protocol`, so the class
-above needs no inheritance to be recognized -- Argus discovers it with
-`isinstance`. Import it when you want a type checker to hold your sink to the
-contract:
-
-```python
-from argus.exporters import BufferedSpanExporter
-
-def build_sink() -> BufferedSpanExporter:
-    return SummaryExporter()
-```
-
-`emit` can be called more than once: a scoped flush emits what has accumulated,
-and spans produced afterwards are emitted by the next flush. So decide what a
-repeat call should do — Argus's own two sinks answer that differently, each way
-suited to its destination. The file exporter keeps its buffer and rewrites the
-trace's files, so each file is always the complete trace; the OTLP exporter
-clears its buffer once the backend confirms the batch, so no span is POSTed
-twice. The example above follows the OTLP shape, reporting only what is new.
+`BufferedSpanExporter` is a runtime-checkable `typing.Protocol`, so a sink needs
+no inheritance to be recognized; import it from `argus.exporters` when you want a
+type checker to hold your sink to the contract. `emit` can be called more than
+once, so a buffered sink has to decide what a repeat call does -- rewrite (as the
+file sink does) or clear once delivered (as the OTLP sink does). The reasoning is
+in [the design notes](docs/design-notes.md#repeat-emits-rewrite-or-clear).
 
 Because `exporters=` replaces the default sink, `output_dir` no longer applies
 (Argus warns if you pass both). To keep the trace files while adding a sink of
-your own, name the file exporter alongside it -- with no arguments it is exactly
-the sink `init` would have built, writing to `<cwd>/traces` under the running
-script's name:
+your own, name `FileSpanExporter()` alongside it -- with no arguments it is
+exactly the sink `init` would have built (`<cwd>/traces`, under the running
+script's name); both arguments override that, e.g.
+`FileSpanExporter("./my_traces", script_name="my_agent")`.
 
-```python
-from argus import FileSpanExporter
-
-argus.init(
-    "my_project_name",
-    exporters=[FileSpanExporter(), SummaryExporter()],
-)
-```
-
-Both of its arguments override what `init` would derive, for the cases where you
-want something else: `FileSpanExporter("./my_traces", script_name="my_agent")`.
+See [docs/examples.md](docs/examples.md#a-sink-of-your-own) for a complete
+buffered-sink example and
+[typing one against the protocol](docs/examples.md#typing-a-sink-against-the-protocol).
 
 ## Excluding code from tracing (`argus.blindspot`)
 
-Argus records everything by default. When a particular workflow -- or a slice
-of one -- should stay off the record (secrets, PII, or just noise), wrap it in
-a `blindspot`. What the scope suppresses is instrumentor spans: the flag Argus
-sets is the one every OpenInference instrumentor checks before recording, so the
-model calls, tool calls and agent steps inside the block never exist -- nothing
-is buffered or written for them. A span you start yourself with
-`tracer.start_as_current_span` is not subject to it; skip those yourself.
+Argus records everything by default. When a particular workflow -- or a slice of
+one -- should stay off the record (secrets, PII, or just noise), wrap it in a
+`blindspot`. It works as a context manager (sync or async) and as a decorator on
+either kind of function.
 
-It works as a context manager (sync or async) and as a decorator on either
-kind of function:
-
-```python
-import argus
-
-argus.init("my_project_name")
-
-with argus.blindspot():            # synchronous block
-    run_sensitive_step()
-
-async with argus.blindspot():      # asynchronous block
-    await run_sensitive_step()
-
-@argus.blindspot()                 # whole function, sync or async
-def internal_workflow(...):
-    ...
-```
+What the scope suppresses is instrumentor spans: the flag Argus sets is the one
+every OpenInference instrumentor checks before recording, so the model calls,
+tool calls and agent steps inside the block never exist -- nothing is buffered or
+written for them. A span you start yourself with `tracer.start_as_current_span`
+is not subject to it; skip those yourself.
 
 The suppression rides on the active context, so it follows `await` points and
 copies into tasks spawned inside the block. It does **not** reach threads you
 start yourself (a raw `threading.Thread` or a `ThreadPoolExecutor`), which begin
 from a fresh context unless you explicitly copy it.
 
-### Generators
-
 The decorator refuses generator and async-generator functions, raising
-`TypeError` at decoration time. A generator runs inside whichever context its
-consumer is in, so suppression held across a `yield` would leak out and silence
-the consumer's code too -- and a wrapper that avoided the leak would leave the
-generator's body unsuppressed instead. Both are silent failures, so Argus
-declines rather than appear to protect a stream it isn't protecting.
-
-Wrap the loop that consumes the generator instead. That covers the generator's
-body and the code handling each item, which is usually what you wanted anyway:
-
-```python
-def stream_answer(prompt):        # left undecorated
-    yield from llm.stream(prompt)
-
-with argus.blindspot():           # covers the generator and the loop body
-    for chunk in stream_answer(sensitive_prompt):
-        handle(chunk)
-```
+`TypeError` at decoration time; wrap the loop that *consumes* the generator
+instead. See [docs/examples.md](docs/examples.md#keeping-a-scope-off-the-record)
+for the recipes ([generators included](docs/examples.md#blindspots-around-a-generator)),
+and [the design notes](docs/design-notes.md#why-the-decorator-refuses-generators)
+for why generators are refused.
 
 ## Instrumentor detection
 
