@@ -19,6 +19,7 @@ from importlib.util import find_spec
 from typing import (
     Any,
     Iterable,
+    Literal,
     Optional,
     Protocol,
     Sequence,
@@ -32,7 +33,7 @@ from opentelemetry.trace import TracerProvider
 # It backs ``instrument="all"`` alone, which loads every instrumentor registered
 # in the group without consulting a key; the curated registry below is a
 # separate route that never reads it.
-ENTRY_POINT_GROUP = "openinference_instrumentor"
+_ENTRY_POINT_GROUP = "openinference_instrumentor"
 
 
 @runtime_checkable
@@ -62,22 +63,46 @@ class Instrumentor(Protocol):
         ...
 
 
+# ``instrument=``'s whole vocabulary, spelled as literals so an editor can
+# complete it and a type checker can reject a typo at the call site instead of
+# leaving it to the runtime ValueError in ``_classes_for_keys``. These are the
+# source of truth for the names: ``_Framework.key`` below is annotated with
+# ``InstrumentKey``, so a registry entry naming anything else is a type error,
+# and the test suite pins the other direction -- every name here has an entry.
+
+#: A curated registry key, naming one framework Argus knows how to instrument.
+InstrumentKey = Literal["openai_agents", "claude", "agno", "openai"]
+
+#: A strategy for choosing keys, rather than a key itself.
+InstrumentStrategy = Literal["curated", "all"]
+
+#: Everything :func:`argus.init`'s ``instrument=`` accepts.
+InstrumentSelection = Union[
+    InstrumentKey, InstrumentStrategy, Sequence[InstrumentKey], None
+]
+
+
 @dataclass(frozen=True)
 class _Framework:
     """A framework Argus knows how to instrument.
 
     ``detector`` is the importable module whose presence signals the framework
-    is in play; ``instrumentors`` are ``"module:ClassName"`` paths to apply.
+    is in play; ``instrumentors`` are ``"module:ClassName"`` paths to apply; and
+    ``supersedes`` names the keys auto-detection drops when this framework is
+    detected, which is what stops a narrower key from doubling up coverage this
+    one already provides. Everything about a framework is therefore one entry --
+    adding another needs no edit anywhere else in this module.
     """
 
-    key: str
+    key: InstrumentKey
     detector: str
     instrumentors: tuple[str, ...]
+    supersedes: tuple[InstrumentKey, ...] = ()
 
 
 # Registry order is the order frameworks are detected, and so the order their
 # instrumentors are applied. It is not what keeps OpenAI calls from being
-# instrumented twice -- _OPENAI_SUPERSEDERS below does that, and reordering
+# instrumented twice -- each entry's ``supersedes`` does that, and reordering
 # these entries would not change it.
 _FRAMEWORKS: tuple[_Framework, ...] = (
     _Framework(
@@ -86,6 +111,10 @@ _FRAMEWORKS: tuple[_Framework, ...] = (
         (
             "openinference.instrumentation.openai_agents:OpenAIAgentsInstrumentor",
         ),
+        # Load-bearing: this instrumentor covers OpenAI client calls itself, so
+        # keeping the standalone key alongside it really would instrument them
+        # twice.
+        supersedes=("openai",),
     ),
     _Framework(
         "claude",
@@ -101,6 +130,12 @@ _FRAMEWORKS: tuple[_Framework, ...] = (
             "openinference.instrumentation.agno:AgnoInstrumentor",
             "openinference.instrumentation.openai:OpenAIInstrumentor",
         ),
+        # Cosmetic, unlike the entry above: Agno's instrumentor does not cover
+        # OpenAI calls, which is why the pair here includes OpenAIInstrumentor
+        # already -- so dropping the standalone key changes the detected keys
+        # and not the classes resolved from them. Kept so the selection does not
+        # read as the double instrumentation that dedupe quietly prevents.
+        supersedes=("openai",),
     ),
     _Framework(
         "openai",
@@ -108,17 +143,10 @@ _FRAMEWORKS: tuple[_Framework, ...] = (
         ("openinference.instrumentation.openai:OpenAIInstrumentor",),
     ),
 )
-_BY_KEY = {fw.key: fw for fw in _FRAMEWORKS}
-
-# Frameworks that make the standalone ``openai`` key redundant, so
-# auto-detection drops it when one of them is present -- for two different
-# reasons. The OpenAI Agents instrumentor covers those calls itself, so adding
-# the standalone one on top really would instrument them twice. Agno's does not
-# cover them, which is why its entry above already pairs AgnoInstrumentor with
-# OpenAIInstrumentor: there the dropped key resolves to a class the selection
-# holds either way, and ``resolve_instrumentors`` dedupes by class, so its
-# membership here shapes the detected keys rather than the outcome.
-_OPENAI_SUPERSEDERS = {"openai_agents", "agno"}
+# Keyed by plain ``str`` on purpose: lookups validate keys that arrive at
+# runtime -- read from a config file, say -- which a ``dict[InstrumentKey, ...]``
+# would reject at the type level while the check still had to happen anyway.
+_BY_KEY: dict[str, _Framework] = {fw.key: fw for fw in _FRAMEWORKS}
 
 
 def _load(path: str) -> Any:
@@ -152,21 +180,24 @@ def _module_available(name: str) -> bool:
         return False
 
 
-def _auto_keys() -> list[str]:
+def _auto_keys() -> list[InstrumentKey]:
     """Detect frameworks in use, preferring what's already imported.
 
-    Falls back to importability when nothing relevant is loaded yet, and drops
-    the standalone OpenAI key when a framework that supersedes it is present.
-    See ``docs/design-notes.md`` ("Curated detection over entry points").
+    Falls back to importability when nothing relevant is loaded yet, then drops
+    every key a detected framework supersedes (see :class:`_Framework`), so a
+    framework's own coverage is never doubled up by a narrower key. See
+    ``docs/design-notes.md`` ("Curated detection over entry points").
     """
     candidates = [fw.key for fw in _FRAMEWORKS if _module_loaded(fw.detector)]
     if not candidates:
         candidates = [
             fw.key for fw in _FRAMEWORKS if _module_available(fw.detector)
         ]
-    if _OPENAI_SUPERSEDERS & set(candidates):
-        candidates = [k for k in candidates if k != "openai"]
-    return candidates
+    detected = set(candidates)
+    superseded = {
+        key for fw in _FRAMEWORKS if fw.key in detected for key in fw.supersedes
+    }
+    return [key for key in candidates if key not in superseded]
 
 
 def _entry_point_classes() -> list[type[Instrumentor]]:
@@ -178,7 +209,7 @@ def _entry_point_classes() -> list[type[Instrumentor]]:
     from importlib.metadata import entry_points
 
     classes: list[type[Instrumentor]] = []
-    for entry_point in entry_points(group=ENTRY_POINT_GROUP):
+    for entry_point in entry_points(group=_ENTRY_POINT_GROUP):
         try:
             classes.append(entry_point.load())
         except Exception:
@@ -208,14 +239,14 @@ def _classes_for_keys(keys: Iterable[str]) -> list[type[Instrumentor]]:
 
 
 def resolve_instrumentors(
-    instrument: Union[str, Sequence[str], None],
+    instrument: InstrumentSelection,
 ) -> list[Instrumentor]:
     """Return instantiated instrumentors for the requested selection.
 
     * ``None`` / ``"curated"``  -> curated auto-detection (default)
     * ``"all"``                 -> entry-point discovery
-    * ``str``                   -> a single registry key (e.g. ``"openai_agents"``)
-    * ``Sequence[str]``         -> explicit list of registry keys
+    * :data:`InstrumentKey`     -> a single registry key (e.g. ``"openai_agents"``)
+    * a sequence of keys        -> exactly those, in the order given
 
     ``None`` is accepted as a synonym for ``"curated"`` so the bare
     ``init(project)`` does the auto-detection.
@@ -223,7 +254,9 @@ def resolve_instrumentors(
     Raises:
         ValueError: If an explicitly requested key is not in the curated
             registry. The message lists the known keys, since a typo is the
-            likely cause. Auto-detection cannot hit this: it selects the keys
+            likely cause -- one a type checker now catches first, but the check
+            stays because a key can arrive at runtime from a config file or a
+            command line. Auto-detection cannot hit this: it selects the keys
             itself.
     """
     if instrument == "all":

@@ -41,11 +41,50 @@ class TestTopLevelSurface:
         assert argus.OtlpConfig is otlp.OtlpConfig
 
 
+class TestSessionSurface:
+    """What a caller may reach for on the object ``init`` hands back.
+
+    Same reasoning as the importable names above: the session's members are
+    hard to take back once someone depends on them, and an undecided surface
+    gets depended on by accident. See ``docs/design-notes.md`` ("The session
+    reports, it does not rewire").
+    """
+
+    def test_exposes_exactly_the_documented_members(self):
+        public = {
+            name for name in vars(argus.Session) if not name.startswith("_")
+        }
+
+        assert public == {
+            "exporters",
+            "flush",
+            "instruments",
+            "project",
+            "provider",
+        }
+
+    def test_everything_readable_is_read_only(self):
+        # Every public member but ``flush`` is a property, which is what makes
+        # the "these report, they do not rewire" contract enforced rather than
+        # merely documented.
+        readable = [
+            name
+            for name in vars(argus.Session)
+            if not name.startswith("_") and name != "flush"
+        ]
+
+        assert all(
+            isinstance(vars(argus.Session)[name], property) for name in readable
+        )
+        assert all(vars(argus.Session)[name].fset is None for name in readable)
+
+
 class TestExportersSurface:
     def test_exports_the_sinks_and_the_protocol(self):
         assert set(exporters.__all__) == {
             "BufferedOTLPExporter",
             "BufferedSpanExporter",
+            "Delivery",
             "FileSpanExporter",
             "OtlpConfig",
             "trace_filename",
@@ -53,6 +92,7 @@ class TestExportersSurface:
 
     def test_names_resolve_to_their_defining_modules(self):
         assert exporters.BufferedSpanExporter is base.BufferedSpanExporter
+        assert exporters.Delivery is base.Delivery
         assert exporters.FileSpanExporter is file.FileSpanExporter
         assert exporters.BufferedOTLPExporter is otlp.BufferedOTLPExporter
         assert exporters.OtlpConfig is otlp.OtlpConfig

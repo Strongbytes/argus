@@ -32,7 +32,7 @@ from opentelemetry.sdk.trace import ReadableSpan
 
 from ..json_utils import expand_embedded_json
 from ..paths import default_traces_dir, detect_script_name
-from .base import _BufferedExporter
+from .base import Delivery, _BufferedExporter
 
 #: Which of a trace's two files is meant; also the file's own format marker.
 TraceFormat = Literal["otlp", "readable"]
@@ -226,7 +226,7 @@ class FileSpanExporter(_BufferedExporter):
             for span in spans
         ]
 
-    def _deliver(self, spans: List[ReadableSpan], *, failed: bool) -> bool:
+    def _deliver(self, spans: List[ReadableSpan], *, failed: bool) -> Delivery:
         """Write each buffered trace's pair of files, keeping the buffer.
 
         Args:
@@ -235,9 +235,10 @@ class FileSpanExporter(_BufferedExporter):
                 crashed run is captured and obvious rather than discarded.
 
         Returns:
-            ``False`` always: the buffer is retained so a later emit rewrites
-            each file from the complete trace rather than appending a fragment.
-            See ``docs/design-notes.md`` ("Repeat emits: rewrite or clear").
+            :attr:`Delivery.RETAINED` always: the buffer is kept so a later emit
+            rewrites each file from the complete trace rather than appending a
+            fragment. See ``docs/design-notes.md`` ("Repeat emits: rewrite or
+            clear").
         """
         for trace_id, trace_spans in self._group_by_trace(spans).items():
             naming = self._naming_for(trace_id, failed)
@@ -251,4 +252,4 @@ class FileSpanExporter(_BufferedExporter):
                 self._base_dir / naming.filename("readable"),
                 self._to_readable(ordered),
             )
-        return False
+        return Delivery.RETAINED

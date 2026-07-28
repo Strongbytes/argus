@@ -26,7 +26,7 @@ from typing import List, Mapping, Optional
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 
-from .base import _BufferedExporter
+from .base import Delivery, _BufferedExporter
 
 # Standard OpenTelemetry env vars naming the endpoint. The traces-specific one is
 # a complete URL; the generic one is a base shared by every signal, to which the
@@ -66,7 +66,7 @@ class OtlpConfig:
     endpoint: Optional[str] = None
     api_key: Optional[str] = None
     headers: Optional[Mapping[str, str]] = None
-    timeout: Optional[int] = None
+    timeout: Optional[float] = None
 
 
 def _resolve_endpoint(endpoint: Optional[str]) -> str:
@@ -166,7 +166,7 @@ def _resolve_auth_headers(
 def _build_transport(
     endpoint: str,
     headers: Mapping[str, str],
-    timeout: Optional[int],
+    timeout: Optional[float],
 ) -> SpanExporter:
     """Construct the underlying OpenTelemetry OTLP/HTTP exporter.
 
@@ -218,7 +218,7 @@ class BufferedOTLPExporter(_BufferedExporter):
         *,
         api_key: Optional[str] = None,
         headers: Optional[Mapping[str, str]] = None,
-        timeout: Optional[int] = None,
+        timeout: Optional[float] = None,
     ) -> None:
         """Prepare an exporter pointed at a backend ingest endpoint.
 
@@ -255,7 +255,7 @@ class BufferedOTLPExporter(_BufferedExporter):
             self._endpoint, _resolve_auth_headers(api_key, headers), timeout
         )
 
-    def _deliver(self, spans: List[ReadableSpan], *, failed: bool) -> bool:
+    def _deliver(self, spans: List[ReadableSpan], *, failed: bool) -> Delivery:
         """POST every buffered span to the endpoint in a single request.
 
         Args:
@@ -265,13 +265,13 @@ class BufferedOTLPExporter(_BufferedExporter):
                 than from a run-level flag, so it is not encoded separately.
 
         Returns:
-            ``True`` once the backend has confirmed the batch, so accepted spans
-            are never POSTed twice; ``False`` after a failed attempt, leaving the
-            spans for a later emit to retry. A failure warns rather than raising
-            (see ``docs/design-notes.md``, "Delivery failures warn, never
-            raise"), and both failure shapes are handled: the transport reports a
-            rejected batch by return value, while a connection error can escape
-            as an exception.
+            :attr:`Delivery.CONSUMED` once the backend has confirmed the batch,
+            so accepted spans are never POSTed twice; :attr:`Delivery.RETAINED`
+            after a failed attempt, leaving the spans for a later emit to retry.
+            A failure warns rather than raising (see ``docs/design-notes.md``,
+            "Delivery failures warn, never raise"), and both failure shapes are
+            handled: the transport reports a rejected batch by return value,
+            while a connection error can escape as an exception.
         """
         try:
             result = self._transport.export(spans)
@@ -283,16 +283,16 @@ class BufferedOTLPExporter(_BufferedExporter):
                 RuntimeWarning,
                 stacklevel=2,
             )
-            return False
+            return Delivery.RETAINED
         if result == SpanExportResult.SUCCESS:
-            return True
+            return Delivery.CONSUMED
         warnings.warn(
             f"Argus: the backend rejected the export of {len(spans)} span(s) "
             f"to {self._endpoint!r}; they were not delivered.",
             RuntimeWarning,
             stacklevel=2,
         )
-        return False
+        return Delivery.RETAINED
 
     def shutdown(self) -> None:
         """Release the transport's resources (e.g. its HTTP session)."""

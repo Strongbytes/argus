@@ -16,6 +16,7 @@ one home:
 
 - [Zero-ceremony capture](#zero-ceremony-capture)
 - [One session per process](#one-session-per-process)
+- [The session reports, it does not rewire](#the-session-reports-it-does-not-rewire)
 - [A flush is not terminal](#a-flush-is-not-terminal)
 - [Buffer now, emit once](#buffer-now-emit-once)
 - [Repeat emits: rewrite or clear](#repeat-emits-rewrite-or-clear)
@@ -32,6 +33,7 @@ one home:
 - [No default OTLP endpoint](#no-default-otlp-endpoint)
 - [Credentials resolved at construction](#credentials-resolved-at-construction)
 - [Delivery failures warn, never raise](#delivery-failures-warn-never-raise)
+- [Swallowed errors are still audible](#swallowed-errors-are-still-audible)
 - [Loading `.env` unconditionally](#loading-env-unconditionally)
 - [Suppression at the source](#suppression-at-the-source)
 - [Why the decorator refuses generators](#why-the-decorator-refuses-generators)
@@ -74,6 +76,43 @@ failure flag. It deliberately does *not* flush — retiring a session and
 emitting its traces are separate decisions — and because the `atexit` hook only
 ever flushes the *active* session, whatever the dropped one had buffered is
 gone unless the caller flushed first.
+
+## The session reports, it does not rewire
+
+What a caller may do with the `Session` `init` returns had one answer nobody
+could see: a sentence in the class docstring calling mutation of its five public
+attributes unsupported. Nothing enforced that, the README never mentioned it,
+and the attributes were plain lists — so `session.exporters.append(my_sink)` was
+the obvious thing to reach for.
+
+It is also the worst thing to reach for. `init` attaches one span processor per
+sink to the provider, so a sink appended afterwards receives no spans at all,
+while `flush` and the exit shutdown still drive it: it gets `emit` or
+`force_flush` and then `shutdown`, and writes an empty trace file. Clearing the
+list instead disables flushing. Neither raises, and neither is discoverable.
+
+The surface is therefore decided rather than inherited. `provider`, `project`,
+`instruments` and `exporters` are read-only properties, and the live
+instrumentors are private — `instruments` already answers the only question a
+caller had for them. `exporters` returns a tuple rather than the list Argus
+drives, and `instruments` is derived on access rather than stored at
+construction, which also retires a copy that could disagree with the
+instrumentors `reset` tears down. `provider` stays as useful as it ever was:
+emitting your own spans through it and pointing an unknown instrumentor at it
+are both documented, and read-only stops it only from being *replaced*, which
+would leave the session flushing sinks that no longer see the spans.
+
+The constructor is internal for a related reason. It takes the `_SpanCounter`
+`init` registered on the provider, so a session built by hand cannot be wired
+correctly anyway; it used to default that argument, which implied otherwise. The
+class stays exported, because a caller still needs the name to annotate what
+`init` returned.
+
+None of this is a cage — `session._exporters` is one underscore away, and a
+tuple protects the container rather than the exporters inside it. The point is
+that the supported path is now visible in the README and pinned by a test, so it
+can be relied on, while everything behind it can still change before the 1.0
+that `major_version_zero` is holding open.
 
 ## A flush is not terminal
 
@@ -142,8 +181,9 @@ cleared only on a *confirmed* success, a failed remote attempt leaves the spans
 intact for the next emit to retry.
 
 `_BufferedExporter` encodes this as the one decision a subclass makes — its
-`_deliver` returns whether the spans were consumed — so neither sink can get
-the buffer bookkeeping wrong.
+`_deliver` returns a `Delivery` outcome (`CONSUMED` or `RETAINED`) — so neither
+sink can get the buffer bookkeeping wrong, and a third-party sink cannot get the
+polarity backwards at the return statement.
 
 ## Exporters Argus does not own
 
@@ -164,7 +204,8 @@ carries the run's outcome.
 
 Failures in either path are swallowed per exporter: a sink that cannot flush or
 close must not take the host program down with it, nor prevent the other sinks
-from being driven.
+from being driven. Swallowed is not silent, though — each failure is
+[reported once](#swallowed-errors-are-still-audible).
 
 ## Extension points are protocols
 
@@ -455,6 +496,29 @@ shapes are handled: the transport reports a rejected batch by *return value*
 (it retries retryable statuses, then gives up) rather than by raising, and a
 connection-level error can still escape as an exception.
 
+## Swallowed errors are still audible
+
+Three places catch `Exception` and carry on: draining a stock exporter with
+`force_flush`, closing the exporters at exit, and uninstrumenting on `reset`.
+The reason is the same each time, and it is the right one — an exporter or an
+instrumentor Argus does not own must not take the host program down, nor stop
+the ones after it from being driven.
+
+Saying nothing about it is not. A bare `pass` means a custom exporter that
+raises on every call produces no trace, no error and no clue, which leaves
+`exporters=` the least debuggable part of the API at exactly the moment it is
+broken. Each swallowed error therefore warns, the same way a [failed remote
+delivery](#delivery-failures-warn-never-raise) does: a `RuntimeWarning` naming
+the object, the call, and what it raised.
+
+Two details keep that from becoming noise of its own. The report is deduped per
+object and call, because `flush` may run many times over a session and a sink
+that fails once usually fails every time — the first report is the useful one.
+And it is attributed to the caller's own `flush()` or `reset()` line, so `python
+-W error`, which promotes these as it does every other Argus warning, points at
+code the caller can act on. On the exit path no such frame exists and the
+`atexit` hook is the best available answer.
+
 ## Loading `.env` unconditionally
 
 `init` loads the nearest `.env` at or above the working directory before
@@ -527,6 +591,12 @@ instrumentor(s) it needs, detected by whether the framework is actually in use.
 It is predictable and avoids double-instrumenting — it won't add the standalone
 OpenAI instrumentor on top of the OpenAI Agents one.
 
+That rule lives on the registry entry itself, as a `supersedes` tuple naming the
+keys detection drops when this framework is present, so adding a framework is
+one self-contained entry rather than an entry plus an edit to a table elsewhere
+in the module. It also generalizes past the one case that motivated it: any
+framework can declare the narrower keys its own coverage makes redundant.
+
 Detection prefers `sys.modules` over importability, so in a shared environment
 with several SDKs installed Argus instruments only the framework the current
 script actually imported, rather than everything present. Instrumentor classes
@@ -538,3 +608,25 @@ registered under the `openinference_instrumentor` group lights up with no code
 change here, at the cost of possibly instrumenting more than intended in a
 multi-framework environment. A broken or incompatible instrumentor is skipped
 rather than allowed to abort the run.
+
+The keys are a type, not just documentation. `instrument=` is annotated with
+literals — `InstrumentKey` for the four framework keys, `InstrumentStrategy` for
+`curated` and `all` — so an editor completes them and a type checker rejects
+`instrument="openai_agent"` at the call site instead of leaving it to the
+`ValueError` at run time. The registry is checked against that type rather than
+the other way round: `_Framework.key` is annotated with `InstrumentKey`, so an
+entry naming something the type does not offer fails to typecheck, and a test
+pins the reverse direction.
+
+The runtime check stays regardless, because a key can arrive from a config file
+or a command line, where no checker ever saw it. That is also the Literal's
+cost: a plain `list[str]` is now a type error even when every string in it is
+valid, so code assembling a selection dynamically annotates it as
+`list[InstrumentKey]` (or casts).
+
+When curated auto-detection (or `"all"`) resolves zero instrumentors, `init`
+emits a `RuntimeWarning` naming the known keys and the `instrument=` argument.
+A bare `argus.init(project)` with no recognized framework otherwise installs
+nothing, produces no spans, and writes no files — silence of the kind the rest
+of `init` refuses. Pass `instrument=[]` to opt out of instrumentation
+deliberately without the warning.

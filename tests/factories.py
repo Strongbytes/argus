@@ -14,10 +14,12 @@ relies on:
 * :class:`RaisingUninstrumentor` -- the same fake with a failing
   ``uninstrument``, so a test can assert that :func:`argus.reset` tears the
   session down anyway rather than propagating a sink's teardown error.
-* :class:`RecordingExporter` -- a real :class:`SpanExporter` that records the
-  spans it is handed and the ``emit`` flushes Argus drives on exit.
-* :class:`PlainSpanExporter` -- the same, minus the ``emit`` hook, standing in
-  for any third-party exporter passed via ``exporters=``.
+* :class:`PlainSpanExporter` -- a real :class:`SpanExporter` that records the
+  spans it is handed and counts the lifecycle calls Argus makes on it, standing
+  in for any third-party exporter passed via ``exporters=``.
+* :class:`RecordingExporter` -- the same plus an ``emit`` hook, so Argus drives
+  it through the buffer-now/emit-once lifecycle its own sinks use. The two
+  together are the whole of the ``exporters=`` contract.
 * :func:`make_span` -- a real :class:`~opentelemetry.sdk.trace.ReadableSpan`
   with a caller-chosen trace id, start time, and attributes. It has to be
   genuine (context, resource, scope, timings) because the file exporter encodes
@@ -72,38 +74,15 @@ class RaisingUninstrumentor(FakeInstrumentor):
         raise RuntimeError("uninstrument boom")
 
 
-class RecordingExporter(SpanExporter):
-    """A real ``SpanExporter`` that records exports and emit flushes.
-
-    Satisfies :class:`~argus.exporters.base.BufferedSpanExporter`, so
-    :meth:`argus.Session.flush` drives it through ``emit`` and tests can assert
-    the failure flag propagates without writing files or hitting the network.
-    """
-
-    def __init__(self) -> None:
-        self.exported_spans: List[Any] = []
-        self.emit_calls: List[bool] = []
-
-    def export(self, spans: Sequence[Any]) -> SpanExportResult:
-        self.exported_spans.extend(spans)
-        return SpanExportResult.SUCCESS
-
-    def emit(self, failed: bool = False) -> None:
-        self.emit_calls.append(failed)
-
-    def force_flush(self, timeout_millis: int = 30_000) -> bool:
-        return True
-
-
 class PlainSpanExporter(SpanExporter):
     """A stock ``SpanExporter`` with no ``emit`` hook, as a third party's would be.
 
-    :class:`RecordingExporter` covers exporters that opt into Argus's
-    buffer-now/emit-once lifecycle; this covers the other half of the
-    ``exporters=`` contract. Argus must drive it the ordinary OpenTelemetry way
-    -- spans handed over as they end, ``force_flush`` when the session flushes,
+    Argus has to drive one of these the ordinary OpenTelemetry way -- spans
+    handed over as they end, ``force_flush`` when the session flushes,
     ``shutdown`` at process exit -- because nothing else in the pipeline will
-    (Argus disables the provider's own shutdown handler).
+    (Argus disables the provider's own shutdown handler). Every one of those
+    calls is counted, so a test can pin which of them a code path made, and
+    which it left alone.
     """
 
     def __init__(self) -> None:
@@ -121,6 +100,25 @@ class PlainSpanExporter(SpanExporter):
 
     def shutdown(self) -> None:
         self.shutdown_count += 1
+
+
+class RecordingExporter(PlainSpanExporter):
+    """The same, plus the ``emit`` hook: the other half of ``exporters=``.
+
+    Defining ``emit`` is the whole of what satisfies
+    :class:`~argus.exporters.base.BufferedSpanExporter`, so
+    :meth:`argus.Session.flush` drives this one through ``emit`` and leaves
+    ``force_flush`` alone -- a distinction the counters inherited above make
+    assertable. Tests use it to pin that the run's outcome propagates, without
+    writing files or hitting the network.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.emit_calls: List[bool] = []
+
+    def emit(self, failed: bool = False) -> None:
+        self.emit_calls.append(failed)
 
 
 _TRACE_IDS = itertools.count(1)

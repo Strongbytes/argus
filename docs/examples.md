@@ -158,7 +158,7 @@ session = argus.init(
 )
 
 print(session.project)      # 'support-bot'
-print(session.instruments)  # ['OpenAIAgentsInstrumentor']
+print(session.instruments)  # ('OpenAIAgentsInstrumentor',)
 ```
 
 The one argument missing from that list is `exporters=`, which *replaces* the

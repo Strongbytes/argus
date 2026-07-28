@@ -12,10 +12,23 @@ clear") for why the lifecycle is shaped this way.
 
 from __future__ import annotations
 
+from enum import Enum, auto
 from typing import List, Protocol, Sequence, runtime_checkable
 
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
+
+
+class Delivery(Enum):
+    """Whether a :meth:`_BufferedExporter._deliver` call consumed its spans.
+
+    The one decision a buffered-sink subclass makes: clear the buffer so the
+    same spans are never delivered again, or keep them for a rewrite / retry.
+    See ``docs/design-notes.md`` ("Repeat emits: rewrite or clear").
+    """
+
+    CONSUMED = auto()
+    RETAINED = auto()
 
 
 @runtime_checkable
@@ -77,10 +90,10 @@ class _BufferedExporter(SpanExporter):
         """
         if not self._spans:
             return
-        if self._deliver(list(self._spans), failed=failed):
+        if self._deliver(list(self._spans), failed=failed) is Delivery.CONSUMED:
             self._spans = []
 
-    def _deliver(self, spans: List[ReadableSpan], *, failed: bool) -> bool:
+    def _deliver(self, spans: List[ReadableSpan], *, failed: bool) -> Delivery:
         """Write or send ``spans``; return whether they may leave the buffer.
 
         Args:
@@ -88,10 +101,11 @@ class _BufferedExporter(SpanExporter):
             failed: Whether the run ended in an unhandled exception.
 
         Returns:
-            ``True`` if the spans are now consumed and must not be delivered
-            again (a POST the backend accepted), ``False`` to keep them for the
-            next emit (a file rewritten from the whole buffer, or a send that
-            failed and deserves a retry).
+            :attr:`Delivery.CONSUMED` if the spans are now consumed and must not
+            be delivered again (a POST the backend accepted);
+            :attr:`Delivery.RETAINED` to keep them for the next emit (a file
+            rewritten from the whole buffer, or a send that failed and deserves
+            a retry).
         """
         raise NotImplementedError
 

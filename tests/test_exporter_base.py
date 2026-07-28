@@ -14,7 +14,7 @@ from typing import Any, List, Tuple
 
 from opentelemetry.sdk.trace.export import SpanExportResult
 
-from argus.exporters import BufferedSpanExporter, FileSpanExporter
+from argus.exporters import BufferedSpanExporter, Delivery, FileSpanExporter
 from argus.exporters.base import _BufferedExporter
 
 from tests.factories import PlainSpanExporter, make_span
@@ -23,20 +23,20 @@ from tests.factories import PlainSpanExporter, make_span
 class _Sink(_BufferedExporter):
     """A minimal sink recording each delivery, with configurable consumption.
 
-    ``consumes`` is what ``_deliver`` reports back: ``True`` for a destination
-    that cannot take the same spans twice (the remote sink after a confirmed
-    POST), ``False`` for one that is rewritten from the whole buffer (the file
-    sink) or that failed and wants a retry.
+    ``outcome`` is what ``_deliver`` reports back: :attr:`Delivery.CONSUMED` for
+    a destination that cannot take the same spans twice (the remote sink after a
+    confirmed POST), :attr:`Delivery.RETAINED` for one that is rewritten from the
+    whole buffer (the file sink) or that failed and wants a retry.
     """
 
-    def __init__(self, consumes: bool = True) -> None:
+    def __init__(self, outcome: Delivery = Delivery.CONSUMED) -> None:
         super().__init__()
-        self.consumes = consumes
+        self.outcome = outcome
         self.deliveries: List[Tuple[List[Any], bool]] = []
 
     def _deliver(self, spans, *, failed):
         self.deliveries.append((list(spans), failed))
-        return self.consumes
+        return self.outcome
 
 
 class TestProtocol:
@@ -90,7 +90,7 @@ class TestBuffering:
         assert sink.deliveries == []
 
     def test_consumed_spans_are_not_delivered_again(self):
-        sink = _Sink(consumes=True)
+        sink = _Sink(outcome=Delivery.CONSUMED)
         sink.export([make_span()])
 
         sink.emit()
@@ -100,8 +100,8 @@ class TestBuffering:
         # repeat emit has nothing to send.
         assert len(sink.deliveries) == 1
 
-    def test_unconsumed_spans_are_delivered_again(self):
-        sink = _Sink(consumes=False)
+    def test_retained_spans_are_delivered_again(self):
+        sink = _Sink(outcome=Delivery.RETAINED)
         first = make_span()
         sink.export([first])
         sink.emit()

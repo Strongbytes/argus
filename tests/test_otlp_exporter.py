@@ -218,12 +218,12 @@ class TestResolveGenericEndpoint:
         assert _resolve_endpoint("http://arg/ingest") == "http://arg/ingest"
 
     def test_init_accepts_a_collector_configured_the_standard_way(
-        self, use_instrumentors, fake_transport, traces_dir, monkeypatch
+        self, use_instrumentors, fake_transport, monkeypatch
     ):
         use_instrumentors(make_instrumentor())
         monkeypatch.setenv(_ENDPOINT_ENV, "http://collector:4318")
 
-        argus.init("proj", otlp=True, output_dir=traces_dir)
+        argus.init("proj", otlp=True)
 
         assert (
             fake_transport.captured["endpoint"]
@@ -409,11 +409,12 @@ class TestAuthWiring:
             _AUTH_HEADER: f"Bearer {_KEY}",
         }
 
-    def test_construction_raises_when_no_key_is_available(
-        self, fake_transport, monkeypatch
-    ):
+    def test_construction_raises_when_no_key_is_available(self, monkeypatch):
         monkeypatch.delenv(_API_KEY_ENV, raising=False)
 
+        # No transport fixture: the headers are resolved on the way into
+        # ``_build_transport``, so this fails before there is a transport to
+        # fake.
         with pytest.raises(ValueError, match=_API_KEY_ENV):
             BufferedOTLPExporter("http://localhost:9000/ingest")
 
@@ -485,15 +486,22 @@ class TestDeliveryFailureIsReportedNotFatal:
 
 
 class TestInitOtlpIntegration:
+    """Remote export as ``init`` assembles it, alongside the on-disk default.
+
+    None of these pass ``output_dir``: the default file sink writes under the
+    working directory, which the autouse ``disposable_working_directory`` fixture
+    has already pointed somewhere throwaway.
+    """
+
     def test_otlp_true_appends_exporter_alongside_file(
-        self, use_instrumentors, fake_transport, traces_dir, monkeypatch
+        self, use_instrumentors, fake_transport, monkeypatch
     ):
         use_instrumentors(make_instrumentor())
         monkeypatch.setenv(
             "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://env:9000/v1/traces"
         )
 
-        session = argus.init("proj", otlp=True, output_dir=traces_dir)
+        session = argus.init("proj", otlp=True)
 
         # OTLP rides alongside the default on-disk exporter, not instead of it.
         kinds = [type(e).__name__ for e in session.exporters]
@@ -504,26 +512,25 @@ class TestInitOtlpIntegration:
             fake_transport.captured["endpoint"] == "http://env:9000/v1/traces"
         )
 
-    def test_otlp_true_without_endpoint_raises(
-        self, use_instrumentors, fake_transport, traces_dir
-    ):
+    def test_otlp_true_without_endpoint_raises(self, use_instrumentors):
         use_instrumentors(make_instrumentor())
 
         # otlp=True with no endpoint anywhere is a misconfiguration: fail loudly
         # at init rather than silently posting to a guessed target. (The autouse
-        # clean_endpoint_env fixture cleared both endpoint variables.)
+        # clean_endpoint_env fixture cleared both endpoint variables.) No
+        # transport fixture: the endpoint is resolved on the way into
+        # ``_build_transport``, so this fails before there is one to fake.
         with pytest.raises(ValueError, match="OTLP endpoint"):
-            argus.init("proj", otlp=True, output_dir=traces_dir)
+            argus.init("proj", otlp=True)
 
     def test_config_endpoint_is_forwarded(
-        self, use_instrumentors, fake_transport, traces_dir
+        self, use_instrumentors, fake_transport
     ):
         use_instrumentors(make_instrumentor())
 
         argus.init(
             "proj",
             otlp=OtlpConfig("http://localhost:9000/api/v1/trace/ingest"),
-            output_dir=traces_dir,
         )
 
         assert (
@@ -532,47 +539,46 @@ class TestInitOtlpIntegration:
         )
 
     def test_config_headers_and_timeout_reach_the_transport(
-        self, use_instrumentors, fake_transport, traces_dir
+        self, use_instrumentors, fake_transport
     ):
         use_instrumentors(make_instrumentor())
 
         # The settings that used to need a hand-built exporter passed through
         # ``exporters=`` now ride on the config, so remote export stays a
-        # one-argument decision even when customized.
+        # one-argument decision even when customized. The timeout is fractional
+        # because the transport takes float seconds, so sub-second budgets have
+        # to survive the pass-through intact.
         argus.init(
             "proj",
             otlp=OtlpConfig(
                 "http://localhost:9000/ingest",
                 headers={"x-tenant": "acme"},
-                timeout=10,
+                timeout=0.5,
             ),
-            output_dir=traces_dir,
         )
 
-        assert fake_transport.captured["timeout"] == 10
+        assert fake_transport.captured["timeout"] == 0.5
         assert fake_transport.captured["headers"] == {
             "x-tenant": "acme",
             _AUTH_HEADER: f"Bearer {_KEY}",
         }
 
-    def test_a_blank_config_endpoint_raises(
-        self, use_instrumentors, fake_transport, traces_dir
-    ):
+    def test_a_blank_config_endpoint_raises(self, use_instrumentors):
         use_instrumentors(make_instrumentor())
 
         # Rather than falling back to the environment behind the caller's back
         # (see TestResolveEndpoint), which is the trap otlp="" used to be.
         with pytest.raises(ValueError, match="empty OTLP endpoint"):
-            argus.init("proj", otlp=OtlpConfig(""), output_dir=traces_dir)
+            argus.init("proj", otlp=OtlpConfig(""))
 
     def test_flush_emits_buffered_spans_to_the_backend(
-        self, use_instrumentors, fake_transport, traces_dir, monkeypatch
+        self, use_instrumentors, fake_transport, monkeypatch
     ):
         use_instrumentors(make_instrumentor())
         monkeypatch.setenv(
             "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://env:9000/v1/traces"
         )
-        session = argus.init("proj", otlp=True, output_dir=traces_dir)
+        session = argus.init("proj", otlp=True)
 
         span = session.provider.get_tracer("test").start_span("work")
         span.end()
@@ -583,7 +589,7 @@ class TestInitOtlpIntegration:
         assert len(fake_transport.exported[0]) == 1
 
     def test_config_api_key_is_forwarded_to_the_otlp_exporter(
-        self, use_instrumentors, fake_transport, traces_dir, monkeypatch
+        self, use_instrumentors, fake_transport, monkeypatch
     ):
         use_instrumentors(make_instrumentor())
         monkeypatch.delenv(_API_KEY_ENV, raising=False)
@@ -593,7 +599,6 @@ class TestInitOtlpIntegration:
             otlp=OtlpConfig(
                 "http://localhost:9000/api/v1/trace/ingest", api_key=_KEY
             ),
-            output_dir=traces_dir,
         )
 
         assert fake_transport.captured["headers"] == {
@@ -601,48 +606,26 @@ class TestInitOtlpIntegration:
         }
 
     def test_api_key_read_from_the_environment(
-        self, use_instrumentors, fake_transport, traces_dir
+        self, use_instrumentors, fake_transport
     ):
         use_instrumentors(make_instrumentor())
 
         # No key in the config: the whole point of the env fallback is that a
         # bare init still authenticates.
-        argus.init(
-            "proj",
-            otlp=OtlpConfig("http://localhost:9000/ingest"),
-            output_dir=traces_dir,
-        )
+        argus.init("proj", otlp=OtlpConfig("http://localhost:9000/ingest"))
 
         assert fake_transport.captured["headers"] == {
             "Authorization": f"Bearer {_KEY}"
         }
 
     def test_otlp_without_any_api_key_raises(
-        self, use_instrumentors, fake_transport, traces_dir, monkeypatch
+        self, use_instrumentors, monkeypatch
     ):
         use_instrumentors(make_instrumentor())
         monkeypatch.delenv(_API_KEY_ENV, raising=False)
 
         with pytest.raises(ValueError, match=_API_KEY_ENV):
-            argus.init(
-                "proj",
-                otlp=OtlpConfig("http://localhost:9000/ingest"),
-                output_dir=traces_dir,
-            )
-
-    def test_otlp_off_by_default(
-        self, use_instrumentors, recording_exporter, monkeypatch
-    ):
-        use_instrumentors(make_instrumentor())
-
-        def boom(*_a, **_k):
-            raise AssertionError("OTLP should not be constructed when off")
-
-        monkeypatch.setattr(session_module, "BufferedOTLPExporter", boom)
-
-        session = argus.init("proj", exporters=[recording_exporter])
-
-        assert session.exporters == [recording_exporter]
+            argus.init("proj", otlp=OtlpConfig("http://localhost:9000/ingest"))
 
 
 class TestOtlpArgumentShape:
@@ -659,19 +642,15 @@ class TestOtlpArgumentShape:
         with pytest.raises(TypeError, match="api_key"):
             argus.init("proj", api_key=_KEY)
 
-    def test_an_endpoint_string_names_its_replacement(
-        self, use_instrumentors, fake_transport, traces_dir
-    ):
+    def test_an_endpoint_string_names_its_replacement(self, use_instrumentors):
         use_instrumentors(make_instrumentor())
 
         # The pre-config spelling. It has to fail loudly rather than be read as
-        # a truthy "on", which would silently ignore the endpoint given.
+        # a truthy "on", which would silently ignore the endpoint given. The
+        # argument is validated before init creates anything at all, so there is
+        # nothing here to point at a temporary directory or a fake transport.
         with pytest.raises(TypeError, match="OtlpConfig") as excinfo:
-            argus.init(
-                "proj",
-                otlp="http://localhost:9000/ingest",
-                output_dir=traces_dir,
-            )
+            argus.init("proj", otlp="http://localhost:9000/ingest")
 
         assert "http://localhost:9000/ingest" in str(excinfo.value)
 
@@ -692,17 +671,19 @@ class TestOtlpArgumentShape:
 
         monkeypatch.setattr(session_module, "BufferedOTLPExporter", boom)
 
+        # ``None`` is also the default, so this covers a bare init too: remote
+        # export costs nothing at all until something asks for it.
         session = argus.init("proj", otlp=value, exporters=[recording_exporter])
 
-        assert session.exporters == [recording_exporter]
+        assert session.exporters == (recording_exporter,)
 
     def test_a_bare_config_matches_otlp_true(
-        self, use_instrumentors, fake_transport, traces_dir, monkeypatch
+        self, use_instrumentors, fake_transport, monkeypatch
     ):
         use_instrumentors(make_instrumentor())
         monkeypatch.setenv(_TRACES_ENDPOINT_ENV, "http://env:9000/v1/traces")
 
-        argus.init("proj", otlp=OtlpConfig(), output_dir=traces_dir)
+        argus.init("proj", otlp=OtlpConfig())
 
         # OtlpConfig() and True say the same thing: on, everything from the
         # environment.
@@ -718,8 +699,9 @@ class TestOtlpArgumentShape:
         with pytest.raises(TypeError):
             argus.init("proj", otlp=42, output_dir=traces_dir)
 
-        # Validated before any provider, exporter or directory exists, so a
-        # rejected call leaves nothing behind to clean up -- including the
-        # singleton, which a later init still needs to claim.
+        # The one place output_dir is still worth passing: it names the directory
+        # this asserts was never created. Validated before any provider, exporter
+        # or directory exists, so a rejected call leaves nothing behind to clean
+        # up -- including the singleton, which a later init still needs to claim.
         assert not traces_dir.exists()
         assert session_module._session is None

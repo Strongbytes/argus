@@ -178,6 +178,34 @@ running afterwards are emitted by the next flush, which the `atexit` hook always
 performs. Flushing twice with nothing new in between does no work, so the
 context manager and the automatic flush cost nothing together.
 
+### The `Session` object
+
+Four read-only properties and one method are the whole of it:
+
+| Member        | What it gives you                                                                                                                                             |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `provider`    | The `TracerProvider` spans come from. Emit your own spans through `provider.get_tracer(...)`, or point an instrumentor Argus doesn't know at it — both in [docs/examples.md](docs/examples.md). |
+| `project`     | The run umbrella passed to `init`.                                                                                                                            |
+| `instruments` | Class names of the instrumentors `init` turned on, e.g. `('OpenAIAgentsInstrumentor',)`.                                                                       |
+| `exporters`   | The sinks a flush drives, as a tuple.                                                                                                                         |
+| `flush()`     | Emit what has been captured so far. Safe to call repeatedly, and not terminal.                                                                                |
+
+```python
+session = argus.init("support-bot")
+print(session.project)      # 'support-bot'
+print(session.instruments)  # ('OpenAIAgentsInstrumentor',)
+```
+
+They report; they don't rewire. Argus drives the exporters and instrumentors on
+flush, on exit and on `reset`, and the provider already carries this session's
+span processors — so these are handed out to read, and none of them can be
+replaced. Appending to `session.exporters` wouldn't work either, which is why it
+is a tuple: a sink added after `init` gets driven on flush but never receives a
+span, so it would write an empty trace. To change what is recorded, call
+`argus.reset()` and `init` again. Everything else on the session — the
+constructor included — is Argus's own and may change between releases; the class
+is exported so you can annotate what `init` handed you.
+
 ### Re-initializing in a notebook or REPL (`argus.reset()`)
 
 Argus is a per-process singleton: a second `argus.init(...)` warns and returns
@@ -527,6 +555,16 @@ use (preferring already-imported modules) and avoiding double-instrumentation:
 
 Pass `instrument="all"` to instead load every instrumentor registered under
 the `openinference_instrumentor` entry-point group.
+
+Those keys are typed rather than merely documented: `instrument=` takes
+`argus.detection.InstrumentKey` literals, so an editor completes them and a type
+checker catches a misspelling before the run. A key assembled dynamically -- from
+a config file, say -- still resolves at run time, where an unknown one raises
+`ValueError` listing the known keys.
+
+If auto-detection finds none of these, `init` warns (a `RuntimeWarning` naming
+the known keys and `instrument=`) rather than silently tracing nothing. Pass
+`instrument=[]` to set up exporters without instrumenting, deliberately.
 
 Whichever route they arrive by, what Argus needs from an instrumentor is two
 methods -- `instrument(tracer_provider=...)` and `uninstrument()` -- expressed as

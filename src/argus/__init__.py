@@ -20,16 +20,21 @@ case, and ``docs/design-notes.md`` for the reasoning behind the design.
 
 from importlib.metadata import PackageNotFoundError, version
 
-from .blindspot import blindspot
-from .exporters.file import FileSpanExporter
-from .exporters.otlp import OtlpConfig
-from .session import Session, init, reset
-
+# Resolved above the submodule imports below, deliberately: ``session`` reads
+# this attribute at import time to stamp ``argus.version`` on every span, and a
+# package still executing its own __init__ can only hand over what it has
+# already assigned. Moving this block down turns ``import argus`` into an
+# ImportError.
 try:
     __version__ = version("argus-trace")
 except PackageNotFoundError:
     # Running from a source tree without installed metadata.
     __version__ = "0.0.0+unknown"
+
+from .blindspot import blindspot
+from .exporters.file import FileSpanExporter
+from .exporters.otlp import OtlpConfig
+from .session import Session, init, reset
 
 __all__ = [
     "FileSpanExporter",
