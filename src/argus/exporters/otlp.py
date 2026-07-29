@@ -160,6 +160,100 @@ def _resolve_auth_headers(
     return merged
 
 
+def _describe_failure(
+    status_code: int | None, error: BaseException | None
+) -> str:
+    """Explain why a delivery failed, in one clause fit to drop into a warning.
+
+    The transport reports a rejected batch only as a failed return value -- the
+    HTTP status and any connection error it saw are logged and then discarded --
+    so on its own a delivery warning can say no more than "not delivered". Given
+    the status code the capturing transport kept (see :func:`_build_transport`),
+    or the exception a connection-level failure raised, this turns that outcome
+    into an actionable reason: a rejected key reads as a 401, an unreachable host
+    as the error it failed with. See ``docs/design-notes.md`` ("Delivery failures
+    name their cause").
+
+    Kept a module function, like :func:`_resolve_endpoint`, so the mapping can be
+    tested without importing the optional OTLP dependency.
+
+    Args:
+        status_code: The HTTP status the backend returned, or ``None`` when the
+            batch never got a response (a connection-level failure, or a status
+            the transport did not surface).
+        error: The exception a connection-level failure raised, or ``None``.
+
+    Returns:
+        A lower-case clause naming the cause, e.g. ``"the backend rejected the
+        API key (401 Unauthorized) ..."``. The API key is never included. When
+        neither a status code nor an error is known, a generic "rejected the
+        batch" clause preserves today's behaviour rather than inventing detail.
+    """
+    if status_code is not None:
+        if status_code == 401:
+            return (
+                "the backend rejected the API key (401 Unauthorized) -- the key "
+                f"in {_API_KEY_ENV_VAR} or api_key is missing, incorrect, or "
+                "revoked"
+            )
+        if status_code == 403:
+            return (
+                "the backend refused the API key (403 Forbidden) -- it was "
+                "recognized but is not authorized for this endpoint or project"
+            )
+        if status_code == 404:
+            return (
+                "the backend returned 404 Not Found -- the endpoint URL or path "
+                "is likely wrong"
+            )
+        if status_code in (400, 422):
+            return (
+                "the backend rejected the batch as malformed "
+                f"(HTTP {status_code}) -- this usually means the endpoint or "
+                "OTLP protocol version does not match"
+            )
+        if status_code == 413:
+            return (
+                "the backend rejected the batch as too large "
+                "(413 Payload Too Large)"
+            )
+        if status_code == 429:
+            return (
+                "the backend is rate limiting the export "
+                "(429 Too Many Requests)"
+            )
+        if 500 <= status_code < 600:
+            return (
+                f"the backend reported a server error (HTTP {status_code}) -- "
+                "this is usually transient"
+            )
+        return f"the backend rejected the batch (HTTP {status_code})"
+    if error is not None:
+        return (
+            "the backend could not be reached "
+            f"({type(error).__name__}: {error})"
+        )
+    return "the backend rejected the batch"
+
+
+def _is_permanent_status(status_code: int) -> bool:
+    """Whether an HTTP status would fail identically if re-sent on a later flush.
+
+    A client error (4xx) means the request itself is wrong -- a rejected key, a
+    wrong endpoint, a malformed batch -- so POSTing the same spans to the same
+    endpoint again can only fail the same way; those spans are dropped rather
+    than retried. Two 4xx statuses are excluded because they can clear on their
+    own between flushes: ``408 Request Timeout`` and ``429 Too Many Requests``.
+    Everything else -- a ``5xx``, a connection error, or any status with no
+    dedicated meaning -- is treated as transient and kept for a retry. See
+    ``docs/design-notes.md`` ("Permanent rejections are not retried").
+
+    Kept a module function, like :func:`_describe_failure`, so the rule is
+    testable without the optional OTLP dependency.
+    """
+    return 400 <= status_code < 500 and status_code not in (408, 429)
+
+
 def _build_transport(
     endpoint: str,
     headers: Mapping[str, str],
@@ -172,6 +266,12 @@ def _build_transport(
     fake transport and never needs the real extra installed. Omitting ``timeout``
     leaves the transport on its own default, which does read
     ``OTEL_EXPORTER_OTLP_TRACES_TIMEOUT``.
+
+    The transport is a thin subclass that remembers the outcome of its last
+    send, so a rejected batch can be described (a 401, an unreachable host)
+    rather than reported as a bare failure -- OpenTelemetry's own exporter keeps
+    none of that once ``export`` returns. See ``docs/design-notes.md``
+    ("Delivery failures name their cause").
 
     Raises:
         ImportError: If the extra is not installed, re-raised with a message
@@ -187,10 +287,43 @@ def _build_transport(
             "with: pip install 'argus-trace[otlp]'"
         ) from exc
 
+    class _CapturingOTLPSpanExporter(OTLPSpanExporter):  # type: ignore[misc,valid-type]
+        """OTLP transport that remembers why its last export failed.
+
+        OpenTelemetry's exporter reports a rejected batch only as a failed
+        return value; the HTTP status and any connection error are logged and
+        then dropped. Overriding the private, per-attempt ``_export`` hook lets
+        the outcome survive: ``last_status_code`` holds the status of the final
+        attempt, ``last_error`` the exception a connection-level failure raised.
+        :meth:`BufferedOTLPExporter._deliver` reads them to name the cause.
+
+        The coupling is deliberately narrow. ``_export`` is delegated to
+        verbatim through ``*args``, so a change to its signature passes straight
+        through; and if a future release drops or renames it, the override simply
+        never runs, the attributes stay ``None``, and the warning falls back to
+        its generic form -- degraded, never broken.
+        """
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)
+            self.last_status_code: int | None = None
+            self.last_error: BaseException | None = None
+
+        def _export(self, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+            self.last_status_code = None
+            self.last_error = None
+            try:
+                response = super()._export(*args, **kwargs)
+            except Exception as exc:
+                self.last_error = exc
+                raise
+            self.last_status_code = getattr(response, "status_code", None)
+            return response
+
     kwargs: dict = {"endpoint": endpoint, "headers": dict(headers)}
     if timeout is not None:
         kwargs["timeout"] = timeout
-    return OTLPSpanExporter(**kwargs)
+    return _CapturingOTLPSpanExporter(**kwargs)
 
 
 class BufferedOTLPExporter(_DeferredExporter):
@@ -264,31 +397,58 @@ class BufferedOTLPExporter(_DeferredExporter):
 
         Returns:
             :attr:`Delivery.CONSUMED` once the backend confirms the batch, so
-            accepted spans are never POSTed twice; :attr:`Delivery.RETAINED`
-            after a failure, which warns rather than raising and leaves the spans
-            for a later emit to retry. See ``docs/design-notes.md`` ("Delivery
-            failures warn, never raise").
+            accepted spans are never POSTed twice. On a failure the batch is
+            warned about (never raised) and then either
+            :attr:`Delivery.DISCARDED`, when the status is a permanent client
+            error a retry could only repeat (see :func:`_is_permanent_status`),
+            or :attr:`Delivery.RETAINED`, when it is transient -- a ``5xx``, a
+            connection error, an unattributed failure -- and a later emit might
+            still deliver it. See ``docs/design-notes.md`` ("Delivery failures
+            warn, never raise", "Permanent rejections are not retried").
+
+        Either way the warning names the cause -- a 401, an unreachable host --
+        via :func:`_describe_failure`, reading the status code or error the
+        transport kept from its last attempt (see ``docs/design-notes.md``,
+        "Delivery failures name their cause").
         """
         try:
             result = self._transport.export(spans)
         except Exception as exc:
-            warnings.warn(
-                f"Argus: failed to export {len(spans)} span(s) to "
-                f"{self._endpoint!r}; they were not delivered "
-                f"({type(exc).__name__}: {exc}).",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+            # The real transport catches connection errors and reports them by
+            # return value, but a caller's own or a future one may still raise.
+            # A connection-level failure is transient, so the spans are kept.
+            self._warn_not_delivered(len(spans), status_code=None, error=exc)
             return Delivery.RETAINED
         if result == SpanExportResult.SUCCESS:
             return Delivery.CONSUMED
-        warnings.warn(
-            f"Argus: the backend rejected the export of {len(spans)} span(s) "
-            f"to {self._endpoint!r}; they were not delivered.",
-            RuntimeWarning,
-            stacklevel=2,
+        status_code = getattr(self._transport, "last_status_code", None)
+        error = getattr(self._transport, "last_error", None)
+        self._warn_not_delivered(
+            len(spans), status_code=status_code, error=error
         )
+        if status_code is not None and _is_permanent_status(status_code):
+            return Delivery.DISCARDED
         return Delivery.RETAINED
+
+    def _warn_not_delivered(
+        self,
+        count: int,
+        *,
+        status_code: int | None,
+        error: BaseException | None,
+    ) -> None:
+        """Warn that ``count`` spans were not delivered, naming the cause.
+
+        The cause is resolved by :func:`_describe_failure` from whichever of the
+        status code or error is known; the API key never appears in either, so
+        it cannot leak through the warning.
+        """
+        warnings.warn(
+            f"Argus: {count} span(s) were not delivered to {self._endpoint!r}: "
+            f"{_describe_failure(status_code, error)}.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
 
     def shutdown(self) -> None:
         """Release the transport's resources (e.g. its HTTP session)."""

@@ -334,6 +334,22 @@ spans leave the buffer, so a mid-run flush never re-sends them. The trade-offs -
 and why the remote sink mirrors the file sink rather than streaming -- are in
 [the design notes](docs/design-notes.md#buffer-now-emit-once).
 
+A backend that rejects or can't be reached never crashes the run; the failure
+surfaces as a `RuntimeWarning` (which `python -W error` can promote to an
+exception) and the local trace files are written regardless. The warning
+**names the cause** rather than saying only "not delivered": a `401` reads as a
+rejected API key and points at `AEGIS_API_KEY`, a `403` as a key without access,
+a `404` as a likely-wrong endpoint, a `5xx` as a transient backend problem, and
+a connection error as the failure it raised. The credential never appears in
+the message. Why it is done this way is in [the design
+notes](docs/design-notes.md#delivery-failures-name-their-cause).
+
+A transient failure (a `5xx`, a connection error) keeps its spans buffered, so a
+later flush can still deliver them. A permanent one -- a rejected key, a wrong
+endpoint, a malformed batch -- does not: re-sending could only be rejected the
+same way, so those spans are dropped after the one warning rather than re-POSTed
+and re-warned on every subsequent flush ([why](docs/design-notes.md#permanent-rejections-are-not-retried)).
+
 A customized remote sink stays a one-argument decision: `OtlpConfig` carries the
 headers and timeout too, so an `OtlpConfig(headers=..., timeout=...)` still runs
 alongside the trace files. Authentication comes from `api_key`/`AEGIS_API_KEY`

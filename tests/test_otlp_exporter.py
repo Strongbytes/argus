@@ -9,6 +9,7 @@ and missing-dependency seams exercise the real import path.
 from __future__ import annotations
 
 import sys
+import warnings
 from typing import Any
 
 import pytest
@@ -18,7 +19,12 @@ import argus
 from argus import OtlpConfig
 from argus import session as session_module
 from argus.exporters import BufferedOTLPExporter
-from argus.exporters.otlp import _resolve_auth_headers, _resolve_endpoint
+from argus.exporters.otlp import (
+    _describe_failure,
+    _is_permanent_status,
+    _resolve_auth_headers,
+    _resolve_endpoint,
+)
 
 # The module whose absence means the ``otlp`` extra isn't installed.
 _OTLP_MODULE = "opentelemetry.exporter.otlp.proto.http.trace_exporter"
@@ -42,6 +48,11 @@ class _RecordingTransport(SpanExporter):
     instead (standing in for a connection error the real transport might let
     escape rather than reporting via return value).
 
+    ``status_code`` stands in for the outcome the real capturing transport keeps
+    from its last attempt: it is exposed as ``last_status_code`` (with
+    ``last_error`` left ``None``), which is what ``_deliver`` reads to describe a
+    rejected batch.
+
     ``captured`` holds the endpoint, headers and timeout the transport was built
     with, filled in by whoever installs it.
     """
@@ -50,12 +61,15 @@ class _RecordingTransport(SpanExporter):
         self,
         result: SpanExportResult = SpanExportResult.SUCCESS,
         raises: Exception | None = None,
+        status_code: int | None = None,
     ) -> None:
         self.exported: list[Any] = []
         self.captured: dict[str, Any] = {}
         self.shutdown_count = 0
         self.result = result
         self.raises = raises
+        self.last_status_code = status_code
+        self.last_error: BaseException | None = None
 
     def export(self, spans) -> SpanExportResult:
         self.exported.append(list(spans))
@@ -308,6 +322,118 @@ class TestResolveAuthHeaders:
             _resolve_auth_headers(_KEY, {"authorization": "Bearer other"})
 
 
+class TestDescribeFailure:
+    """The status/error -> reason mapping a delivery warning is built from.
+
+    Tested directly, the way the endpoint and header rules are: the mapping is a
+    module function precisely so it needs neither the network nor the ``otlp``
+    extra to exercise.
+    """
+
+    def test_401_names_the_key_and_the_env_var(self):
+        reason = _describe_failure(401, None)
+
+        assert "401" in reason
+        # The fix points at the credential by name, not at a bare status.
+        assert _API_KEY_ENV in reason
+        assert "api_key" in reason
+
+    def test_403_reads_as_forbidden_not_unauthenticated(self):
+        reason = _describe_failure(403, None)
+
+        assert "403" in reason
+        assert "Forbidden" in reason
+
+    def test_404_points_at_the_endpoint(self):
+        reason = _describe_failure(404, None)
+
+        assert "404" in reason
+        assert "endpoint" in reason
+
+    @pytest.mark.parametrize("code", [400, 422])
+    def test_client_errors_read_as_malformed(self, code):
+        reason = _describe_failure(code, None)
+
+        assert str(code) in reason
+        assert "malformed" in reason
+
+    def test_413_reads_as_too_large(self):
+        assert "too large" in _describe_failure(413, None)
+
+    def test_429_reads_as_rate_limited(self):
+        assert "rate limiting" in _describe_failure(429, None)
+
+    @pytest.mark.parametrize("code", [500, 503, 599])
+    def test_5xx_reads_as_a_transient_server_error(self, code):
+        reason = _describe_failure(code, None)
+
+        assert str(code) in reason
+        assert "server error" in reason
+
+    def test_an_unbucketed_status_still_carries_its_code(self):
+        # A status with no dedicated wording is still more useful with its
+        # number than without it.
+        reason = _describe_failure(418, None)
+
+        assert "418" in reason
+        assert "rejected" in reason
+
+    def test_a_connection_error_names_its_type_and_message(self):
+        reason = _describe_failure(None, ConnectionError("refused"))
+
+        assert "could not be reached" in reason
+        assert "ConnectionError" in reason
+        assert "refused" in reason
+
+    def test_a_status_code_wins_over_an_error(self):
+        # The final attempt got an HTTP response, so the status is the more
+        # precise cause even if an earlier attempt raised.
+        reason = _describe_failure(401, ConnectionError("earlier blip"))
+
+        assert "401" in reason
+        assert "earlier blip" not in reason
+
+    def test_nothing_known_falls_back_to_the_generic_reason(self):
+        # Neither a status nor an error: preserve the pre-differentiation
+        # wording rather than invent a cause.
+        reason = _describe_failure(None, None)
+
+        assert reason == "the backend rejected the batch"
+
+    def test_no_reason_leaks_the_shape_of_a_key(self):
+        # None of the buckets echoes a caller value, so none can carry a secret.
+        for reason in (
+            _describe_failure(401, None),
+            _describe_failure(500, None),
+            _describe_failure(None, ConnectionError("refused")),
+        ):
+            assert "Bearer" not in reason
+            assert "sk_" not in reason
+
+
+class TestIsPermanentStatus:
+    """Which failures are worth retrying on a later flush, and which are not.
+
+    A module function, like the endpoint and describe rules, so the retry
+    policy is pinned without the network or the ``otlp`` extra.
+    """
+
+    @pytest.mark.parametrize("code", [400, 401, 403, 404, 413, 422])
+    def test_client_errors_are_permanent(self, code):
+        # The request itself is wrong, so re-sending it can only fail again.
+        assert _is_permanent_status(code) is True
+
+    @pytest.mark.parametrize("code", [408, 429])
+    def test_timeout_and_rate_limit_are_not_permanent(self, code):
+        # Both can clear on their own between flushes, so they stay retryable.
+        assert _is_permanent_status(code) is False
+
+    @pytest.mark.parametrize("code", [500, 502, 503, 504])
+    def test_server_errors_are_not_permanent(self, code):
+        # A backend that is down or overloaded may recover before the next emit.
+        assert _is_permanent_status(code) is False
+
+
 class TestMissingDependency:
     def test_construction_raises_actionable_error(self, monkeypatch):
         # Simulate the extra not being installed: a None entry in sys.modules
@@ -479,6 +605,101 @@ class TestDeliveryFailureIsReportedNotFatal:
         exporter.emit()
         # The spans survived the failed attempt and were delivered on retry.
         assert transport.exported[-1] == ["span-a"]
+
+    def test_rejected_batch_warning_names_the_status_cause(
+        self, install_transport
+    ):
+        # A 401 the transport captured turns the generic "rejected" line into
+        # one that points at the credential -- the whole point of the change.
+        install_transport(result=SpanExportResult.FAILURE, status_code=401)
+        exporter = BufferedOTLPExporter("http://localhost:9000/ingest")
+        exporter.export(["span-a"])
+
+        with pytest.warns(RuntimeWarning, match="401 Unauthorized") as recorded:
+            exporter.emit()
+
+        assert _API_KEY_ENV in str(recorded[0].message)
+
+    def test_a_captured_server_error_reads_as_transient(
+        self, install_transport
+    ):
+        install_transport(result=SpanExportResult.FAILURE, status_code=503)
+        exporter = BufferedOTLPExporter("http://localhost:9000/ingest")
+        exporter.export(["span-a"])
+
+        with pytest.warns(RuntimeWarning, match="503"):
+            exporter.emit()
+
+    def test_rejection_without_a_captured_status_stays_generic(
+        self, install_transport
+    ):
+        # No status kept (the fake leaves last_status_code None): the warning
+        # falls back to the pre-differentiation wording rather than breaking.
+        install_transport(result=SpanExportResult.FAILURE)
+        exporter = BufferedOTLPExporter("http://localhost:9000/ingest")
+        exporter.export(["span-a"])
+
+        with pytest.warns(RuntimeWarning, match="rejected the batch"):
+            exporter.emit()
+
+
+class TestPermanentRejectionsAreNotRetried:
+    """A failure a retry can't fix drops the buffer; a transient one keeps it.
+
+    The distinction only shows across *flushes*: on a single on-exit emit either
+    outcome warns once. What it buys is that a run flushing repeatedly against a
+    wrong key or endpoint doesn't re-POST and re-warn on every flush.
+    """
+
+    def test_a_permanent_client_error_drops_the_buffer(self, install_transport):
+        # A 401 will fail the same way next flush, so the spans are let go
+        # rather than retried.
+        transport = install_transport(
+            result=SpanExportResult.FAILURE, status_code=401
+        )
+        exporter = BufferedOTLPExporter("http://localhost:9000/ingest")
+        exporter.export(["span-a"])
+
+        with pytest.warns(RuntimeWarning, match="401"):
+            exporter.emit()
+
+        # Even if the key were fixed, a permanent failure cleared the buffer, so
+        # a later flush has nothing to re-send: exactly one POST was attempted.
+        transport.result = SpanExportResult.SUCCESS
+        exporter.emit()
+        assert transport.exported == [["span-a"]]
+
+    def test_a_permanent_error_warns_once_across_flushes(
+        self, install_transport
+    ):
+        install_transport(result=SpanExportResult.FAILURE, status_code=403)
+        exporter = BufferedOTLPExporter("http://localhost:9000/ingest")
+        exporter.export(["span-a"])
+
+        with warnings.catch_warnings(record=True) as recorded:
+            warnings.simplefilter("always")
+            exporter.emit()
+            exporter.emit()
+
+        # The dropped buffer means the second flush is a no-op: no warning storm.
+        assert len(recorded) == 1
+
+    def test_a_transient_server_error_keeps_the_buffer(self, install_transport):
+        # A 503 may clear before the next flush, so the spans are retained and a
+        # later successful emit still delivers them.
+        transport = install_transport(
+            result=SpanExportResult.FAILURE, status_code=503
+        )
+        exporter = BufferedOTLPExporter("http://localhost:9000/ingest")
+        exporter.export(["span-a"])
+
+        with pytest.warns(RuntimeWarning, match="503"):
+            exporter.emit()
+
+        transport.result = SpanExportResult.SUCCESS
+        exporter.emit()
+        # First a failed attempt, then the retry that lands: the spans survived.
+        assert transport.exported == [["span-a"], ["span-a"]]
 
 
 class TestInitOtlpIntegration:

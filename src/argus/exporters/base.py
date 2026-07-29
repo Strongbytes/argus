@@ -21,14 +21,24 @@ from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 
 
 class Delivery(Enum):
-    """Whether a :meth:`_DeferredExporter._deliver` call consumed its spans.
+    """What a :meth:`_DeferredExporter._deliver` call decided about its spans.
 
-    The one decision a buffered-sink subclass makes: clear the buffer so the
-    same spans are never delivered again, or keep them for a rewrite / retry.
-    See ``docs/design-notes.md`` ("Repeat emits: rewrite or clear").
+    The one decision a buffered-sink subclass makes is whether the buffer holds
+    on to the spans it was just handed. Two outcomes drop them -- the run is done
+    with them, whether the backend took them (:attr:`CONSUMED`) or will never
+    take them (:attr:`DISCARDED`) -- and one keeps them for a later emit to
+    rewrite or retry (:attr:`RETAINED`). See ``docs/design-notes.md`` ("Repeat
+    emits: rewrite or clear").
     """
 
+    # Delivered and accepted: drop the spans so they are never sent twice.
     CONSUMED = auto()
+    # Undeliverable and not worth another attempt (a rejected key, a wrong
+    # endpoint): drop the spans so a later flush doesn't retry a send that
+    # cannot succeed. The failure has already been surfaced as a warning.
+    DISCARDED = auto()
+    # A file to rewrite from the whole buffer, or a send that failed transiently
+    # and deserves a retry: keep the spans for the next emit.
     RETAINED = auto()
 
 
@@ -91,7 +101,10 @@ class _DeferredExporter(SpanExporter):
         """
         if not self._spans:
             return
-        if self._deliver(list(self._spans), failed=failed) is Delivery.CONSUMED:
+        outcome = self._deliver(list(self._spans), failed=failed)
+        # Anything but RETAINED means the run is done with these spans -- they
+        # were delivered or are undeliverable -- so the buffer lets them go.
+        if outcome is not Delivery.RETAINED:
             self._spans = []
 
     def _deliver(self, spans: list[ReadableSpan], *, failed: bool) -> Delivery:
@@ -104,9 +117,11 @@ class _DeferredExporter(SpanExporter):
         Returns:
             :attr:`Delivery.CONSUMED` if the spans are now consumed and must not
             be delivered again (a POST the backend accepted);
-            :attr:`Delivery.RETAINED` to keep them for the next emit (a file
-            rewritten from the whole buffer, or a send that failed and deserves
-            a retry).
+            :attr:`Delivery.DISCARDED` if they cannot be delivered and a retry
+            would fail the same way (a rejected key, a wrong endpoint), so they
+            are dropped rather than re-attempted; :attr:`Delivery.RETAINED` to
+            keep them for the next emit (a file rewritten from the whole buffer,
+            or a send that failed transiently and deserves a retry).
         """
         raise NotImplementedError
 

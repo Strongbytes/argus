@@ -25,8 +25,10 @@ class _Sink(_DeferredExporter):
 
     ``outcome`` is what ``_deliver`` reports back: :attr:`Delivery.CONSUMED` for
     a destination that cannot take the same spans twice (the remote sink after a
-    confirmed POST), :attr:`Delivery.RETAINED` for one that is rewritten from the
-    whole buffer (the file sink) or that failed and wants a retry.
+    confirmed POST), :attr:`Delivery.DISCARDED` for a batch that is undeliverable
+    and not worth retrying (the remote sink after a permanent rejection), and
+    :attr:`Delivery.RETAINED` for one that is rewritten from the whole buffer
+    (the file sink) or that failed transiently and wants a retry.
     """
 
     def __init__(self, outcome: Delivery = Delivery.CONSUMED) -> None:
@@ -98,6 +100,17 @@ class TestBuffering:
 
         # The remote sink's shape: an accepted batch leaves the buffer, so a
         # repeat emit has nothing to send.
+        assert len(sink.deliveries) == 1
+
+    def test_discarded_spans_are_not_delivered_again(self):
+        sink = _Sink(outcome=Delivery.DISCARDED)
+        sink.export([make_span()])
+
+        sink.emit()
+        sink.emit()
+
+        # An undeliverable batch also leaves the buffer -- like CONSUMED, and
+        # unlike RETAINED -- so a permanent failure isn't retried on every emit.
         assert len(sink.deliveries) == 1
 
     def test_retained_spans_are_delivered_again(self):

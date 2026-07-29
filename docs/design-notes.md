@@ -33,6 +33,8 @@ one home:
 - [No default OTLP endpoint](#no-default-otlp-endpoint)
 - [Credentials resolved at construction](#credentials-resolved-at-construction)
 - [Delivery failures warn, never raise](#delivery-failures-warn-never-raise)
+- [Delivery failures name their cause](#delivery-failures-name-their-cause)
+- [Permanent rejections are not retried](#permanent-rejections-are-not-retried)
 - [Swallowed errors are still audible](#swallowed-errors-are-still-audible)
 - [Loading `.env` unconditionally](#loading-env-unconditionally)
 - [Suppression at the source](#suppression-at-the-source)
@@ -181,9 +183,13 @@ cleared only on a *confirmed* success, a failed remote attempt leaves the spans
 intact for the next emit to retry.
 
 `_DeferredExporter` encodes this as the one decision a subclass makes — its
-`_deliver` returns a `Delivery` outcome (`CONSUMED` or `RETAINED`) — so neither
-sink can get the buffer bookkeeping wrong, and a third-party sink cannot get the
-polarity backwards at the return statement.
+`_deliver` returns a `Delivery` outcome — so neither sink can get the buffer
+bookkeeping wrong, and a third-party sink cannot get the polarity backwards at
+the return statement. The decision is really binary (keep the spans or let them
+go), but there are two reasons to let them go: `CONSUMED`, delivered and
+accepted, and `DISCARDED`, [undeliverable and not worth
+retrying](#permanent-rejections-are-not-retried). `RETAINED` is the only outcome
+that keeps them, so `emit` clears the buffer on anything else.
 
 ## Exporters Argus does not own
 
@@ -502,6 +508,71 @@ can promote to an exception for callers who want strictness. Both failure
 shapes are handled: the transport reports a rejected batch by *return value*
 (it retries retryable statuses, then gives up) rather than by raising, and a
 connection-level error can still escape as an exception.
+
+## Delivery failures name their cause
+
+A warning that says only "the batch was not delivered" leaves the caller to
+guess between the handful of things that actually go wrong — a wrong API key, a
+key without access, a mistyped endpoint, an unreachable host. The distinctions
+are exactly the ones a person needs to act, so the warning names the cause: a
+`401` reads as a rejected key (and points at `AEGIS_API_KEY` / `api_key`), a
+`403` as a key that lacks access, a `404` as a likely-wrong endpoint, a `4xx`
+body error as a malformed batch, a `5xx` as a transient backend problem, and a
+connection-level failure as the exception it raised.
+
+The obstacle is that OpenTelemetry's exporter throws that information away.
+`export()` returns only success or failure; the HTTP status and any connection
+error are logged and then dropped, and the retry bookkeeping lives on an
+internal object Argus cannot reach. Rather than reimplement the wire protocol
+(see [above](#no-default-otlp-endpoint)) or scrape the transport's log lines —
+whose text is not an API — Argus subclasses the transport and overrides the
+one private seam that still has the answer: the per-attempt `_export`, which
+returns the raw HTTP response or raises the connection error. The override
+records the last attempt's status code (or exception) and delegates everything
+else untouched, so all of OpenTelemetry's retry, backoff, and encoding still
+run. `_deliver` reads what was recorded and hands it to `_describe_failure`,
+which is a module function — like the endpoint and header rules — so the whole
+status-to-sentence mapping is testable without the network or the `otlp` extra.
+
+The coupling to a private method is deliberately made cheap to lose. `_export`
+is delegated to through `*args`, so a change to its signature passes straight
+through; and if a release renames or drops it, the override simply never runs,
+the recorded status stays absent, and the warning falls back to the same
+generic "rejected the batch" line it used before — degraded, never broken. The
+status buckets are the same principle: an unrecognised code still reports its
+number, so a backend Argus has no dedicated wording for is never *less* legible
+than it was. Throughout, the credential is never part of the message — the
+mapping only ever echoes a status code or an exception type, neither of which
+can carry the key.
+
+## Permanent rejections are not retried
+
+A failed delivery [keeps its spans buffered](#repeat-emits-rewrite-or-clear) so
+a later emit can retry — the right move when the cause is transient, since a
+[flush is not terminal](#a-flush-is-not-terminal) and a backend that was down or
+throttling may have recovered by the next one. But not every failure is
+transient. A `401`, a `403`, a `404`, a malformed-batch `400`/`422` — these are
+verdicts on the request itself, so re-POSTing the same spans to the same
+endpoint with the same key can only earn the same rejection. Retaining them
+would buy nothing and cost twice: a run that flushes repeatedly (a notebook, a
+long service) would re-send the doomed batch and re-warn on *every* flush, and
+the buffer would grow without bound holding spans that can never leave it.
+
+So `_deliver` splits the failure return. Once the [status code is
+known](#delivery-failures-name-their-cause), a client error (`4xx`) that a retry
+cannot fix returns `DISCARDED` — the spans are dropped, the single warning
+already stands, and later flushes are silent — while everything transient
+(`5xx`, a connection error, a failure with no status to judge) returns
+`RETAINED` and is kept for another attempt. The split is conservative in the
+uncertain direction: an unattributed failure is retried, not discarded, so a
+gap only ever comes from a status Argus is confident is permanent.
+
+Two `4xx` codes are deliberately treated as transient: `408 Request Timeout` and
+`429 Too Many Requests`, both of which can clear between flushes on their own.
+The rule is one module function (`_is_permanent_status`) beside the message
+mapping, testable without the network, and it never drops silently — the run
+still has its local trace files, and the warning that preceded the drop named
+exactly why the backend refused the spans.
 
 ## Swallowed errors are still audible
 
