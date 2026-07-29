@@ -1,3 +1,9 @@
+## v0.8.0 (2026-07-29)
+
+### Feat
+
+- better error msg for server issues
+
 ## v0.7.0 (2026-07-28)
 
 ### Feat
