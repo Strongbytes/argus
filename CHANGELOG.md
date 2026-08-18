@@ -1,3 +1,9 @@
+## v0.9.0 (2026-08-18)
+
+### Feat
+
+- add detection for patched methods
+
 ## v0.8.0 (2026-07-29)
 
 ### Feat
