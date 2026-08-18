@@ -454,6 +454,54 @@ the runtime-checkable `argus.detection.Instrumentor` protocol. OpenInference's
 instrumentors satisfy it by way of OpenTelemetry's `BaseInstrumentor`, and so
 does anything of your own that defines the two, with nothing to inherit from.
 
+### Import order, and names imported *out* of a framework
+
+Instrumenting a framework means rebinding a name in it, so a call only picks the
+instrumentation up if it looks that name up when it runs. Attribute and method
+calls do -- `claude_agent_sdk.query(...)`, `Runner.run(...)`, `agent.arun(...)`
+all resolve through a module or a class at call time -- so importing a framework
+before `init` is fine, and is what the examples do (it is also the reliable
+detection signal).
+
+A `from` import of a **free function** is the one exception. It copies the
+function object, so a name bound before `init` keeps pointing at the
+un-instrumented original:
+
+```python
+from claude_agent_sdk import query   # binds the function itself
+argus.init("my_project_name")        # rebinds claude_agent_sdk.query
+query(prompt=...)                    # still the original -- not traced
+```
+
+Nothing raises: the call just produces no span, and a run whose traced work all
+goes through that name writes no trace file at all. Either fix works, and both
+are one line:
+
+```python
+import argus
+argus.init("my_project_name")        # init first, then import
+from claude_agent_sdk import query
+
+# ...or keep the import where it is and call through the module
+import claude_agent_sdk
+argus.init("my_project_name")
+claude_agent_sdk.query(prompt=...)
+```
+
+`init` detects this rather than leaving you to it: if a name in your code is
+still bound to a function the instrumentors just replaced, it emits a
+`RuntimeWarning` naming that binding (`__main__.query`), the function it should
+have reached, and both fixes. The check compares what each patch replaced
+against what is still bound elsewhere, so it stays quiet unless a call really
+would go untraced -- an import *after* `init`, a call through the module, or a
+class-based framework never triggers it. Only module-level bindings are found (the
+shape a `from` import produces); the reasoning and the limits are in [the design
+notes](docs/design-notes.md#stale-bindings-from-an-import-before-init).
+
+Of the four keys, `claude` is currently the only one with a free function to get
+wrong: `claude_agent_sdk.query`. The class-based entry points -- including
+`ClaudeSDKClient` -- are unaffected whatever the import order.
+
 ## Roadmap
 
 - Span scrubbing/redaction hook before export.

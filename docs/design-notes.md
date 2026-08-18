@@ -40,6 +40,7 @@ one home:
 - [Suppression at the source](#suppression-at-the-source)
 - [Why the decorator refuses generators](#why-the-decorator-refuses-generators)
 - [Curated detection over entry points](#curated-detection-over-entry-points)
+- [Stale bindings from an import before init](#stale-bindings-from-an-import-before-init)
 
 ## Zero-ceremony capture
 
@@ -720,3 +721,84 @@ A bare `argus.init(project)` with no recognized framework otherwise installs
 nothing, produces no spans, and writes no files — silence of the kind the rest
 of `init` refuses. Pass `instrument=[]` to opt out of instrumentation
 deliberately without the warning.
+
+## Stale bindings from an import before init
+
+Instrumentation works by rebinding a name. After `ClaudeAgentSDKInstrumentor`
+runs, `claude_agent_sdk.query` names a wrapper that opens a span and delegates
+to the function it replaced, and the call `claude_agent_sdk.query(...)` picks
+that up because the attribute is read at call time. A method call
+(`Runner.run(...)`, `agent.arun(...)`) resolves through its class the same way,
+which is why importing a class before `init` is harmless — and why the OpenAI,
+OpenAI Agents and Agno paths never had this problem.
+
+A `from` import resolves nothing later. It copies the object:
+
+```python
+from claude_agent_sdk import query   # binds the function object itself
+argus.init("my_project")             # rebinds claude_agent_sdk.query
+query(prompt=...)                    # still the original — no span
+```
+
+Nothing raises. No span is started, so the buffered exporters have nothing to
+emit, no trace file is written, and the run is indistinguishable from one where
+Argus was never installed. That is the worst failure shape Argus has: the
+symptom (an empty `traces/` directory) points at the exporters, the timestamp
+scheme, the flush — everywhere except the import on line 3.
+
+### Detecting it, rather than guessing at it
+
+The cheap version of this check is "warn when a framework known to patch free
+functions was already in `sys.modules` at `init` time". `_module_loaded` already
+answers that, and it is one line. It is also wrong often enough to be worse than
+nothing: importing the SDK before `init` is what the examples in
+[docs/examples.md](examples.md) recommend (it is the reliable detection signal),
+and most of those imports are fine — `import claude_agent_sdk` and a
+`claude_agent_sdk.query(...)` call, a `ClaudeSDKClient` session, a `from` import
+of anything method-based. A warning that says "your traces are missing" has to
+be right, or the next real one gets filtered out with it.
+
+So `argus.bindings` uses the patch itself as the signal. `init` snapshots each
+registry-declared free function before turning the instrumentors on, and
+compares afterwards:
+
+- An attribute holding the same object as before was **not patched** — whatever
+  is bound to it elsewhere is the live function, so there is nothing to report.
+  This is what keeps `instrument=[]`, an unaffected framework, and an upstream
+  release that stops patching the name all quiet.
+- An attribute whose object **changed** was really rebound, so every *other*
+  module-level name still bound to the object it replaced is a call site
+  instrumentation cannot reach. Those are the findings, named by module and
+  attribute — `__main__.query` — because the binding is where the fix goes.
+
+Identity, not attribute name, is what the scan matches on, so
+`from claude_agent_sdk import query as q` is found too. Three families of holder
+are skipped: the framework's own package (that is where the function is
+*defined*), and `openinference`/`wrapt` (the instrumentation machinery keeps the
+original precisely so `uninstrument` can put it back). Reporting either would be
+a false alarm on every single run.
+
+### What it costs and what it misses
+
+The scan walks the loaded modules' namespaces once, and only when something was
+actually patched — a framework nobody imported before `init` is never even
+snapshotted, so the common (correct) order pays nothing at all. `sys.modules` is
+copied before iteration, since an import on another thread would otherwise
+resize it mid-walk, and a module-like object whose namespace cannot be read (a
+lazy-import shim) is skipped rather than allowed to raise.
+
+It finds module-level bindings, which is the shape `from x import y` produces. A
+stale reference captured anywhere else — a default argument, a class attribute, a
+closure — is invisible to it, and deliberately so: there is no reliable way to
+reach those, and a check that claimed to cover them would be trusted further
+than it deserves. The warning therefore names what it found without claiming to
+be exhaustive.
+
+Rebinding the caller's stale names automatically was considered and rejected.
+Argus could walk the same namespaces and `setattr` the wrapper over each stale
+reference, which would make the broken order simply work. It would also mean a
+tracing library reaching into other modules' namespaces and mutating them, which
+is a much larger promise than "we record what your agents do" — and one that
+fails in confusing ways when the name was shadowed or re-exported deliberately.
+Naming the problem is enough: both fixes (move the `init` above the import, or
+call through the module) are one line, and the warning states them.

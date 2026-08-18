@@ -8,6 +8,12 @@ entry points").
 
 :class:`Instrumentor` is the contract everything here resolves to, and the one
 Argus drives: the extension point for a framework it doesn't know about yet.
+
+A registry entry carries everything Argus knows about its framework, which
+includes one thing detection itself never reads: the free functions the
+framework's instrumentor patches by rebinding. :mod:`argus.bindings` watches
+those, so that a name imported from the framework before ``init`` ran is
+reported instead of quietly going untraced.
 """
 
 from __future__ import annotations
@@ -89,17 +95,22 @@ class _Framework:
     """A framework Argus knows how to instrument.
 
     ``detector`` is the importable module whose presence signals the framework
-    is in play; ``instrumentors`` are ``"module:ClassName"`` paths to apply; and
+    is in play; ``instrumentors`` are ``"module:ClassName"`` paths to apply;
     ``supersedes`` names the keys auto-detection drops when this framework is
     detected, which is what stops a narrower key from doubling up coverage this
-    one already provides. Everything about a framework is therefore one entry --
-    adding another needs no edit anywhere else in this module.
+    one already provides; and ``free_functions`` names the module-level
+    functions of ``detector`` that its instrumentor patches by rebinding, which
+    :mod:`argus.bindings` watches because a ``from``-import of one of those
+    before ``init`` freezes the un-instrumented original. Everything about a
+    framework is therefore one entry -- adding another needs no edit anywhere
+    else in this module.
     """
 
     key: InstrumentKey
     detector: str
     instrumentors: tuple[str, ...]
     supersedes: tuple[InstrumentKey, ...] = ()
+    free_functions: tuple[str, ...] = ()
 
 
 # Registry order is the order frameworks are detected, and so the order their
@@ -124,6 +135,11 @@ _FRAMEWORKS: tuple[_Framework, ...] = (
         (
             "openinference.instrumentation.claude_agent_sdk:ClaudeAgentSDKInstrumentor",
         ),
+        # The one framework here whose entry point is a free function rather than
+        # a method: its instrumentor rebinds ``claude_agent_sdk.query``, so a
+        # ``from claude_agent_sdk import query`` above the ``init`` line keeps
+        # calling the original. See :mod:`argus.bindings`.
+        free_functions=("query",),
     ),
     _Framework(
         "agno",

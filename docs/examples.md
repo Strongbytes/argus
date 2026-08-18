@@ -15,6 +15,7 @@ the thing you're trying to do.
 - [The shortest thing that works](#the-shortest-thing-that-works)
 - [OpenAI Agents SDK](#openai-agents-sdk)
 - [Claude Agent SDK](#claude-agent-sdk)
+- [A free function imported before init](#a-free-function-imported-before-init)
 - [Agno](#agno)
 - [The OpenAI client, used directly](#the-openai-client-used-directly)
 - [Choosing the instrumentors yourself](#choosing-the-instrumentors-yourself)
@@ -78,14 +79,51 @@ nothing to put your imports at the top.
 ## Claude Agent SDK
 
 `pip install "argus-trace[claude]"`, and import the SDK before `init` so
-detection sees it already loaded:
+detection sees it already loaded — as the module, calling `query` through it:
 
 ```python
 import anyio
 import argus
-from claude_agent_sdk import query
+import claude_agent_sdk
 
 argus.init("support-bot")
+
+
+async def main():
+    async for message in claude_agent_sdk.query(
+        prompt="Summarize today's incidents."
+    ):
+        print(message)
+
+
+anyio.run(main)
+```
+
+Detecting the Claude Agent SDK turns on `ClaudeAgentSDKInstrumentor`, so each
+`query` is captured without your naming it. The one-shot `query` above is the
+shortest form; a stateful `ClaudeSDKClient` session traces the same way.
+
+The module import is deliberate. `query` is a free function, and instrumenting
+it means rebinding `claude_agent_sdk.query` — so a `from claude_agent_sdk import
+query` above the `init` line would keep the original, un-instrumented function
+and quietly produce no spans at all. Calling through the module looks the name up
+at call time, so it always finds the instrumented one. See
+[the recipe below](#a-free-function-imported-before-init) if you'd rather keep
+the `from` import.
+
+## A free function imported before init
+
+`from claude_agent_sdk import query` copies the function object, so a name bound
+before `init` never sees the instrumentation. If you want that spelling, put
+`init` above it:
+
+```python
+import anyio
+import argus
+
+argus.init("support-bot")
+
+from claude_agent_sdk import query  # noqa: E402 -- after init, on purpose
 
 
 async def main():
@@ -96,9 +134,26 @@ async def main():
 anyio.run(main)
 ```
 
-Detecting the Claude Agent SDK turns on `ClaudeAgentSDKInstrumentor`, so each
-`query` is captured without your naming it. The one-shot `query` above is the
-shortest form; a stateful `ClaudeSDKClient` session traces the same way.
+Detection still works: with nothing loaded yet Argus falls back to asking
+whether `claude_agent_sdk` is importable, which it is.
+
+Get it the other way round and Argus tells you rather than tracing nothing — a
+`RuntimeWarning` at your `init` line naming the stale binding, the function it
+should have reached, and both fixes:
+
+```text
+Argus: claude_agent_sdk was imported before argus.init() ran, so __main__.query
+still points at the original, un-instrumented claude_agent_sdk.query. [...] Fix
+it by calling argus.init() before importing claude_agent_sdk, or by importing
+the module and calling claude_agent_sdk.query(...), where the name is looked up
+at call time.
+```
+
+Promote it to an exception with `python -W error` if you'd rather the run stop.
+Only free functions are affected: methods (`Runner.run`, `agent.arun`,
+`ClaudeSDKClient.query`) resolve through their class at call time, so the import
+order never matters for them. [Why the check works this
+way](design-notes.md#stale-bindings-from-an-import-before-init).
 
 ## Agno
 

@@ -34,6 +34,7 @@ from opentelemetry.sdk.trace import (
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor, SpanExporter
 
 from . import __version__ as argus_version
+from .bindings import snapshot_free_functions, warn_stale_bindings
 from .detection import (
     _BY_KEY,
     Instrumentor,
@@ -486,8 +487,12 @@ def init(
     unchanged; call :func:`reset` first to genuinely reconfigure. Auto-detection
     (or ``instrument="all"``) finding no instrumentors likewise warns rather
     than silently tracing nothing; pass ``instrument=[]`` to opt out
-    deliberately. See ``docs/design-notes.md`` ("One session per process",
-    "Curated detection over entry points").
+    deliberately. So does a name a caller imported *out* of a framework before
+    this call -- ``from claude_agent_sdk import query`` -- which keeps the
+    un-instrumented function and would otherwise go untraced in silence (see
+    :mod:`argus.bindings`). See ``docs/design-notes.md`` ("One session per
+    process", "Curated detection over entry points", "Stale bindings from an
+    import before init").
 
     Args:
         project: Argus's logical run umbrella, stamped on every span as
@@ -583,8 +588,15 @@ def init(
         instrument is None or instrument in ("curated", "all")
     ):
         _warn_no_instrumentors()
+    # Taken before the patching and read after it: a name a caller imported from
+    # a framework before this line keeps the un-instrumented function, and
+    # comparing the two is what tells that apart from a name resolved at call
+    # time. See ``docs/design-notes.md`` ("Stale bindings from an import before
+    # init").
+    watched = snapshot_free_functions()
     for instrumentor in instances:
         instrumentor.instrument(tracer_provider=provider)
+    warn_stale_bindings(watched)
 
     session = Session(
         provider=provider,
