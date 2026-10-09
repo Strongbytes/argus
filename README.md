@@ -63,6 +63,8 @@ The package is named `argus-trace` and imported as `argus`. Install it with
 pip install "argus-trace[openai-agents]"   # OpenAI Agents SDK
 pip install "argus-trace[claude]"          # Claude Agent SDK
 pip install "argus-trace[agno]"            # Agno
+pip install "argus-trace[langchain]"       # LangChain
+pip install "argus-trace[langgraph]"       # LangGraph
 pip install "argus-trace[openai]"          # OpenAI client, used directly
 pip install "argus-trace[otlp]"            # remote OTLP/HTTP export
 ```
@@ -433,7 +435,26 @@ use (preferring already-imported modules) and avoiding double-instrumentation:
 | `openai_agents` | `agents`           | `OpenAIAgentsInstrumentor`                |
 | `claude`        | `claude_agent_sdk` | `ClaudeAgentSDKInstrumentor`              |
 | `agno`          | `agno`             | `AgnoInstrumentor` + `OpenAIInstrumentor` |
+| `langchain`     | `langchain_core`   | `LangChainInstrumentor`                   |
+| `langgraph`     | `langgraph`        | `LangChainInstrumentor`                   |
 | `openai`        | `openai`           | `OpenAIInstrumentor`                      |
+
+`langchain` and `langgraph` are two names for one instrumentor. OpenInference has
+no separate LangGraph instrumentor: `LangChainInstrumentor` hooks the
+`langchain-core` callbacks, which LangGraph runs on too, so it traces graph runs
+as well. The two keys exist so you can name what you actually use. Detection
+keys off `langchain_core` rather than `langchain`, because LangGraph and
+`langchain-openai` work without the `langchain` package but never without
+`langchain-core`. If a script imports both, the instrumentor is turned on once.
+
+LangChain's model packages (`langchain-openai`, say) call the OpenAI SDK
+underneath, so detecting `langchain` or `langgraph` drops the standalone `openai`
+key. Keeping it would report every model call twice -- same token counts, and as a
+separate trace, since LangChain's spans are not attached to the OpenTelemetry
+context the OpenAI ones start from. The cost is that a node calling the raw
+`openai` client directly is not traced. `instrument=["langchain", "openai"]` turns
+it back on -- an explicit list is never trimmed -- and accepts that duplication for
+every LangChain model call.
 
 Pass `instrument="all"` to instead load every instrumentor registered under
 the `openinference_instrumentor` entry-point group.
@@ -498,7 +519,7 @@ class-based framework never triggers it. Only module-level bindings are found (t
 shape a `from` import produces); the reasoning and the limits are in [the design
 notes](docs/design-notes.md#stale-bindings-from-an-import-before-init).
 
-Of the four keys, `claude` is currently the only one with a free function to get
+Of the six keys, `claude` is currently the only one with a free function to get
 wrong: `claude_agent_sdk.query`. The class-based entry points -- including
 `ClaudeSDKClient` -- are unaffected whatever the import order.
 

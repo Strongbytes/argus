@@ -273,6 +273,65 @@ class TestCuratedDetectionForReal:
             "OpenAIAgentsInstrumentor"
         ]
 
+    def test_langchain_is_detected_through_langchain_core(
+        self, frameworks_in_use
+    ):
+        # The detector is the module the instrumentor patches, not the
+        # ``langchain`` package: LangGraph and ``langchain-openai`` run without
+        # the latter, never without the former.
+        frameworks_in_use("langchain")
+
+        result = detection.resolve_instrumentors(None)
+
+        assert detection._BY_KEY["langchain"].detector == "langchain_core"
+        assert [type(i).__name__ for i in result] == ["LangChainInstrumentor"]
+
+    def test_langgraph_alone_turns_on_the_langchain_instrumentor(
+        self, frameworks_in_use
+    ):
+        # OpenInference has no LangGraph instrumentor; the LangChain one traces
+        # graph runs because both sit on ``langchain_core``'s callbacks.
+        frameworks_in_use("langgraph")
+
+        result = detection.resolve_instrumentors(None)
+
+        assert [type(i).__name__ for i in result] == ["LangChainInstrumentor"]
+
+    def test_langchain_and_langgraph_together_instrument_once(
+        self, frameworks_in_use
+    ):
+        # The common case -- a LangGraph app imports both -- must not patch
+        # ``langchain_core`` twice, which would add the tracer handler twice
+        # and double every span.
+        frameworks_in_use("langchain", "langgraph")
+
+        result = detection.resolve_instrumentors(None)
+
+        assert [type(i).__name__ for i in result] == ["LangChainInstrumentor"]
+
+    @pytest.mark.parametrize("key", ["langchain", "langgraph"])
+    def test_langchain_does_not_double_up_with_openai(
+        self, key, frameworks_in_use
+    ):
+        # ``langchain-openai`` calls the OpenAI SDK, so the standalone
+        # instrumentor would add a second LLM span under LangChain's own, with
+        # the same token counts.
+        frameworks_in_use(key, "openai")
+
+        result = detection.resolve_instrumentors(None)
+
+        assert [type(i).__name__ for i in result] == ["LangChainInstrumentor"]
+
+    def test_explicit_keys_can_still_pair_langchain_with_openai(self):
+        # The documented escape hatch for a node that calls the raw client:
+        # supersession shapes auto-detection only, never an explicit list.
+        result = detection.resolve_instrumentors(["langchain", "openai"])
+
+        assert [type(i).__name__ for i in result] == [
+            "LangChainInstrumentor",
+            "OpenAIInstrumentor",
+        ]
+
     def test_every_framework_on_its_own_turns_something_on(
         self, frameworks_in_use
     ):
@@ -357,6 +416,16 @@ class TestClassesForKeys:
             "openinference.instrumentation.openai:OpenAIInstrumentor",
         ]
 
+    @pytest.mark.parametrize("key", ["langchain", "langgraph"])
+    def test_langchain_and_langgraph_resolve_to_the_same_instrumentor(
+        self, key, monkeypatch
+    ):
+        monkeypatch.setattr(detection, "_load", lambda path: path)
+
+        assert detection._classes_for_keys([key]) == [
+            "openinference.instrumentation.langchain:LangChainInstrumentor"
+        ]
+
 
 class TestLoad:
     """The lazy-import seam, run rather than stubbed.
@@ -425,6 +494,19 @@ class TestAutoKeys:
         # agno already pairs in the OpenAI instrumentor, so dropping the
         # standalone "openai" key changes the detected keys, not the classes.
         assert detection._auto_keys() == ["agno"]
+
+    def test_langgraph_app_is_detected_without_the_langchain_package(
+        self, monkeypatch
+    ):
+        # A LangGraph app on ``langchain-openai`` never imports ``langchain``;
+        # what it does import is ``langchain_core`` and, usually, ``openai``.
+        monkeypatch.setattr(
+            detection,
+            "_module_loaded",
+            lambda name: name in {"langchain_core", "langgraph", "openai"},
+        )
+
+        assert detection._auto_keys() == ["langchain", "langgraph"]
 
     def test_keeps_openai_when_it_is_the_only_framework(self, monkeypatch):
         monkeypatch.setattr(

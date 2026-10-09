@@ -700,8 +700,44 @@ change here, at the cost of possibly instrumenting more than intended in a
 multi-framework environment. A broken or incompatible instrumentor is skipped
 rather than allowed to abort the run.
 
+### One instrumentor, two names
+
+LangChain and LangGraph are separate products that share one instrumentor.
+OpenInference publishes no LangGraph instrumentor; `LangChainInstrumentor` wraps
+`langchain_core`'s `BaseCallbackManager.__init__` and adds its tracer as an
+inheritable handler, and LangGraph runs on those same callbacks, so graph runs
+are traced without anything LangGraph-specific. The registry still has an entry
+for each, because a key is also what a caller types in `instrument=` and what an
+extra is named for, and "Unknown instrument key: 'langgraph'" would be an
+unhelpful answer to someone who is plainly using it. Both entries name the same
+class, and `resolve_instrumentors` instantiates a class once however many keys
+reach it, so a script importing both patches `langchain_core` once rather than
+adding the tracer handler twice.
+
+`langchain` is detected through `langchain_core`, not the `langchain` package.
+LangGraph and `langchain-openai` are routinely used without `langchain`, but
+nothing in the family runs without `langchain_core`, which is also the module
+the instrumentor patches. The detector is therefore the thing actually being
+instrumented. The price is breadth: anything that imports `langchain_core`,
+including a library pulling it in as a dependency, now selects the instrumentor.
+Detection prefers `sys.modules`, so only a real import does.
+
+Both entries supersede `openai`, and unlike Agno's this is not cosmetic.
+`langchain-openai` calls the OpenAI SDK, so with the OpenAI instrumentor also on,
+every model call is reported twice -- once as LangChain's LLM span, once as an
+OpenAI one, each with the same token counts, so a backend summing usage counts it
+twice. The second does not nest under the first: `LangChainInstrumentor`
+deliberately never attaches its spans to the OpenTelemetry context (it is a
+callback system, and a context attached there may never be detached), so the
+OpenAI span has no parent to find and starts a trace of its own. The run is
+double-counted *and* split. Dropping `openai` costs a node that calls the raw
+client directly its span, and `instrument=["langchain", "openai"]` brings it back
+-- supersession only shapes auto-detection, never an explicit list -- at the price
+of that duplication for every LangChain model call. The same property means a span
+of your own started inside a LangChain node will not nest under the node either.
+
 The keys are a type, not just documentation. `instrument=` is annotated with
-literals — `InstrumentKey` for the four framework keys, `InstrumentStrategy` for
+literals — `InstrumentKey` for the framework keys, `InstrumentStrategy` for
 `curated` and `all` — so an editor completes them and a type checker rejects
 `instrument="openai_agent"` at the call site instead of leaving it to the
 `ValueError` at run time. The registry is checked against that type rather than
@@ -730,7 +766,7 @@ to the function it replaced, and the call `claude_agent_sdk.query(...)` picks
 that up because the attribute is read at call time. A method call
 (`Runner.run(...)`, `agent.arun(...)`) resolves through its class the same way,
 which is why importing a class before `init` is harmless — and why the OpenAI,
-OpenAI Agents and Agno paths never had this problem.
+OpenAI Agents, Agno, LangChain and LangGraph paths never had this problem.
 
 A `from` import resolves nothing later. It copies the object:
 

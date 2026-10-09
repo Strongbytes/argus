@@ -28,6 +28,12 @@ agno = [
     "openinference-instrumentation-agno",
     "openinference-instrumentation-openai",
 ]
+# Both keys resolve to the same instrumentor: OpenInference has no separate
+# LangGraph one, because LangGraph runs on the ``langchain-core`` callbacks the
+# LangChain instrumentor hooks. Two extras so the install line can name what you
+# use.
+langchain = ["openinference-instrumentation-langchain"]
+langgraph = ["openinference-instrumentation-langchain"]
 # Matches the curated ``openai`` key, for a script calling the OpenAI client
 # directly rather than through an agent framework.
 openai = ["openinference-instrumentation-openai"]

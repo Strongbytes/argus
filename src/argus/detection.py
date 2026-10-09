@@ -79,7 +79,9 @@ class Instrumentor(Protocol):
 # and the test suite pins the other direction -- every name here has an entry.
 
 #: A curated registry key, naming one framework Argus knows how to instrument.
-InstrumentKey = Literal["openai_agents", "claude", "agno", "openai"]
+InstrumentKey = Literal[
+    "openai_agents", "claude", "agno", "openai", "langchain", "langgraph"
+]
 
 #: A strategy for choosing keys, rather than a key itself.
 InstrumentStrategy = Literal["curated", "all"]
@@ -153,6 +155,45 @@ _FRAMEWORKS: tuple[_Framework, ...] = (
         # already -- so dropping the standalone key changes the detected keys
         # and not the classes resolved from them. Kept so the selection does not
         # read as the double instrumentation that dedupe quietly prevents.
+        supersedes=("openai",),
+    ),
+    # LangChain and LangGraph are two names for one instrumentor. OpenInference
+    # ships no LangGraph instrumentor: ``LangChainInstrumentor`` hooks
+    # ``langchain_core``'s callback manager, which LangGraph runs on too, so it
+    # traces graph runs as well. The two entries exist so ``instrument=`` and
+    # the extras can say what the caller is actually using, and a class is
+    # instantiated once however many keys name it (see
+    # ``resolve_instrumentors``).
+    #
+    # ``langchain`` is detected through ``langchain_core`` rather than the
+    # ``langchain`` package: LangGraph (and ``langchain-openai`` and friends) can
+    # be used without ``langchain`` itself, but never without ``langchain_core``,
+    # which is also the module the instrumentor patches. ``langgraph``'s own
+    # detector never changes what auto-detection turns on: anything that imports
+    # it has already imported ``langchain_core``, so ``langchain`` is detected
+    # too and both keys resolve to the one instrumentor. The entry earns its
+    # place as a key -- an explicit ``instrument="langgraph"`` consults no
+    # detector at all.
+    #
+    # Load-bearing, unlike Agno's: ``langchain-openai`` calls the OpenAI SDK
+    # underneath, and the standalone OpenAI instrumentor would report the same
+    # call a second time -- same token counts, so a backend would count them
+    # twice. LangChain's tracer never attaches its spans to the OpenTelemetry
+    # context, so the second one does not nest under the first: it arrives as a
+    # trace of its own. The cost of dropping it is that a node calling the raw
+    # ``openai`` client directly goes untraced; ``instrument=["langchain",
+    # "openai"]`` opts back in, with that duplication for every LangChain model
+    # call.
+    _Framework(
+        "langchain",
+        "langchain_core",
+        ("openinference.instrumentation.langchain:LangChainInstrumentor",),
+        supersedes=("openai",),
+    ),
+    _Framework(
+        "langgraph",
+        "langgraph",
+        ("openinference.instrumentation.langchain:LangChainInstrumentor",),
         supersedes=("openai",),
     ),
     _Framework(

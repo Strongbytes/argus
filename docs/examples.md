@@ -17,6 +17,7 @@ the thing you're trying to do.
 - [Claude Agent SDK](#claude-agent-sdk)
 - [A free function imported before init](#a-free-function-imported-before-init)
 - [Agno](#agno)
+- [LangChain and LangGraph](#langchain-and-langgraph)
 - [The OpenAI client, used directly](#the-openai-client-used-directly)
 - [Choosing the instrumentors yourself](#choosing-the-instrumentors-yourself)
 - [Every argument at once](#every-argument-at-once)
@@ -175,6 +176,58 @@ own steps and `OpenAIInstrumentor` for the model calls underneath them, since
 Agno's instrumentor doesn't cover those itself. You get the whole stack from the
 one `init`, without naming either.
 
+## LangChain and LangGraph
+
+`pip install "argus-trace[langgraph]"` (or `[langchain]` -- the two extras install
+the same instrumentor):
+
+```python
+import argus
+from langchain_openai import ChatOpenAI
+from langgraph.graph import END, START, MessagesState, StateGraph
+
+argus.init("research-agent")
+
+llm = ChatOpenAI(model="gpt-4o-mini")
+
+graph = StateGraph(MessagesState)
+graph.add_node("chat", lambda state: {"messages": [llm.invoke(state["messages"])]})
+graph.add_edge(START, "chat")
+graph.add_edge("chat", END)
+
+graph.compile().invoke({"messages": [("user", "Summarize today's incidents.")]})
+```
+
+LangChain and LangGraph are one instrumentor, `LangChainInstrumentor`. It hooks
+the `langchain-core` callbacks that both run on, so a graph run, its nodes, the
+model calls and the tool calls all land in a single trace, nested the way they
+ran. `session.instruments` reports one entry even when the script imports both.
+Detection keys off `langchain_core`, so a LangGraph app that never imports the
+`langchain` package -- `langgraph` plus `langchain-openai`, say -- is found too.
+
+Any provider's chat model works, not just OpenAI's: the instrumentor sits on
+`langchain-core`, so `ChatAnthropic` (`langchain-anthropic`) and the rest get LLM
+spans with model name and token counts the same way. The `openai` handling below
+is specific to OpenAI only because OpenAI is the one provider SDK Argus also
+instruments itself; there is nothing to double up with for Claude. If a script also
+imports `claude_agent_sdk`, Argus turns on that instrumentor as well, and you need
+both extras (`argus-trace[langgraph,claude]`).
+
+Detecting either drops the standalone `openai` key. `ChatOpenAI` calls the OpenAI
+SDK underneath, and the OpenAI instrumentor would report each of those calls a
+second time: same token counts, and in a trace of its own rather than nested under
+LangChain's span. If a node calls the raw `openai` client directly and you want
+that traced, ask for both -- knowing that every `ChatOpenAI` call is then reported
+twice as well:
+
+```python
+argus.init("research-agent", instrument=["langchain", "openai"])
+```
+
+Parallel branches, `ainvoke` and `stream`/`astream` all trace correctly, and a
+[`blindspot`](#keeping-a-scope-off-the-record) holds across parallel branches
+(which LangGraph runs on a thread pool) and `astream`.
+
 ## The OpenAI client, used directly
 
 No agent framework needed — `pip install "argus-trace[openai]"` traces plain
@@ -205,7 +258,8 @@ argus.init("everything", instrument="all")              # entry-point discovery
 argus.init("no-framework", instrument=[])               # instrument nothing
 ```
 
-The curated keys are `openai_agents`, `claude`, `agno`, and `openai` (the README
+The curated keys are `openai_agents`, `claude`, `agno`, `langchain`, `langgraph`,
+and `openai` (the README
 has the table of what each detects and applies). A key that isn't one of them
 raises `ValueError` listing the ones that are, so a typo fails at your `init`
 line instead of producing a run with nothing instrumented.

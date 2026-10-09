@@ -489,6 +489,8 @@ class TestNoInstrumentorsWarning:
         assert "openai_agents" in message
         assert "claude" in message
         assert "agno" in message
+        assert "langchain" in message
+        assert "langgraph" in message
         assert "openai" in message
 
     def test_no_warning_when_instrument_is_explicitly_empty(

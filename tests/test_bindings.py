@@ -422,7 +422,16 @@ class TestTheRealRegistry:
         # ``client.chat.completions.create``), looked up through the class at
         # call time, so an import before init cannot freeze them. Declaring one
         # here would warn about an import order that is fine.
-        for key in ("openai_agents", "agno", "openai"):
+        #
+        # LangChain and LangGraph are no different: the instrumentor wraps
+        # ``BaseCallbackManager.__init__``, a method.
+        for key in (
+            "openai_agents",
+            "agno",
+            "openai",
+            "langchain",
+            "langgraph",
+        ):
             assert detection._BY_KEY[key].free_functions == ()
 
     def test_declared_free_functions_are_plain_attribute_names(self):
