@@ -1,9 +1,8 @@
-## Unreleased
+## v0.11.0 (2026-10-09)
 
 ### Feat
 
-- crewai support: crew, task, agent, tool and flow spans, with the LLM spans coming from the openai key
-- warn on init when OTEL_SDK_DISABLED=true has switched the OpenTelemetry SDK off
+- add crew ai, adjust plan for future implementation
 
 ## v0.10.0 (2026-10-09)
 
