@@ -1,4 +1,15 @@
+## Unreleased
+
+### Feat
+
+- crewai support: crew, task, agent, tool and flow spans, with the LLM spans coming from the openai key
+- warn on init when OTEL_SDK_DISABLED=true has switched the OpenTelemetry SDK off
+
 ## v0.10.0 (2026-10-09)
+
+### Feat
+
+- langchain and langgraph support: one instrumentor under two keys, detected through langchain_core, superseding the standalone openai key
 
 ## v0.9.0 (2026-08-18)
 

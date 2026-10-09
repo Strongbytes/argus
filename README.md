@@ -65,6 +65,7 @@ pip install "argus-trace[claude]"          # Claude Agent SDK
 pip install "argus-trace[agno]"            # Agno
 pip install "argus-trace[langchain]"       # LangChain
 pip install "argus-trace[langgraph]"       # LangGraph
+pip install "argus-trace[crewai]"          # CrewAI
 pip install "argus-trace[openai]"          # OpenAI client, used directly
 pip install "argus-trace[otlp]"            # remote OTLP/HTTP export
 ```
@@ -166,6 +167,12 @@ pytest --cov --cov-report=html     # also write an htmlcov/ report to browse
 `project` and `service` land on every span as resource attributes, alongside a
 third Argus stamps itself: `argus.version`, the version of Argus that recorded
 the trace, so a trace file read later says which release produced it.
+
+`init` honours OpenTelemetry's `OTEL_SDK_DISABLED=true`, but warns when it is set
+(a `RuntimeWarning`, checked after `.env` is loaded). The variable switches the
+SDK off, so the instrumentors still turn on and the run records nothing at all.
+CrewAI accepts it as a way to turn off its own telemetry, which makes it easy to
+set without meaning to switch Argus off.
 
 `init` returns a `Session` that flushes automatically via `atexit`. It can also
 be used as a context manager for deterministic, scoped flushing:
@@ -430,14 +437,15 @@ for why generators are refused.
 By default Argus uses a curated registry, detecting the framework actually in
 use (preferring already-imported modules) and avoiding double-instrumentation:
 
-| Key             | Detected via       | Instrumentors                             |
-| --------------- | ------------------ | ----------------------------------------- |
-| `openai_agents` | `agents`           | `OpenAIAgentsInstrumentor`                |
-| `claude`        | `claude_agent_sdk` | `ClaudeAgentSDKInstrumentor`              |
-| `agno`          | `agno`             | `AgnoInstrumentor` + `OpenAIInstrumentor` |
-| `langchain`     | `langchain_core`   | `LangChainInstrumentor`                   |
-| `langgraph`     | `langgraph`        | `LangChainInstrumentor`                   |
-| `openai`        | `openai`           | `OpenAIInstrumentor`                      |
+| Key             | Detected via       | Instrumentors                               |
+| --------------- | ------------------ | ------------------------------------------- |
+| `openai_agents` | `agents`           | `OpenAIAgentsInstrumentor`                  |
+| `claude`        | `claude_agent_sdk` | `ClaudeAgentSDKInstrumentor`                |
+| `agno`          | `agno`             | `AgnoInstrumentor` + `OpenAIInstrumentor`   |
+| `langchain`     | `langchain_core`   | `LangChainInstrumentor`                     |
+| `langgraph`     | `langgraph`        | `LangChainInstrumentor`                     |
+| `crewai`        | `crewai`           | `CrewAIInstrumentor`                        |
+| `openai`        | `openai`           | `OpenAIInstrumentor`                        |
 
 `langchain` and `langgraph` are two names for one instrumentor. OpenInference has
 no separate LangGraph instrumentor: `LangChainInstrumentor` hooks the
@@ -455,6 +463,26 @@ context the OpenAI ones start from. The cost is that a node calling the raw
 `openai` client directly is not traced. `instrument=["langchain", "openai"]` turns
 it back on -- an explicit list is never trimmed -- and accepts that duplication for
 every LangChain model call.
+
+CrewAI's instrumentor records crews, tasks, agents, tools and flows, but no model
+calls. Those come from the `openai` key, which auto-detection picks alongside
+`crewai` because CrewAI imports `openai` itself, and they nest under the task
+that made the call. That covers crews on OpenAI and on the OpenAI-compatible
+providers CrewAI builds on the OpenAI SDK (OpenRouter, DeepSeek, Ollama and the
+like). A crew on Anthropic, Gemini, Bedrock or LiteLLM is traced without its LLM
+spans. Unlike `agno`, `crewai` doesn't pair the OpenAI instrumentor itself, so:
+
+- An explicit `instrument="crewai"` has no LLM spans; ask for
+  `["crewai", "openai"]`.
+- A crew that also uses LangChain has `openai` dropped like any other LangChain
+  run, so `ChatOpenAI` calls are reported once, but the CrewAI agents' own
+  OpenAI calls go untraced. `instrument=["crewai", "langchain", "openai"]` traces
+  both and reports every `ChatOpenAI` call twice.
+
+Don't turn CrewAI's own telemetry off with `OTEL_SDK_DISABLED=true`: that
+switches off the OpenTelemetry SDK Argus runs on too, and the run records nothing
+(`init` warns when it is set). `CREWAI_DISABLE_TELEMETRY=true` turns off only
+CrewAI's.
 
 Pass `instrument="all"` to instead load every instrumentor registered under
 the `openinference_instrumentor` entry-point group.
@@ -519,7 +547,7 @@ class-based framework never triggers it. Only module-level bindings are found (t
 shape a `from` import produces); the reasoning and the limits are in [the design
 notes](docs/design-notes.md#stale-bindings-from-an-import-before-init).
 
-Of the six keys, `claude` is currently the only one with a free function to get
+Of the seven keys, `claude` is currently the only one with a free function to get
 wrong: `claude_agent_sdk.query`. The class-based entry points -- including
 `ClaudeSDKClient` -- are unaffected whatever the import order.
 

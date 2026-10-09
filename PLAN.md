@@ -1,259 +1,283 @@
-# Plan: LangChain, LangGraph and CrewAI support
+# Plan: Anthropic, Agno and CrewAI provider coverage
 
-Status:
+What is left to implement. The LangChain, LangGraph and CrewAI work is done and
+its rationale is in `docs/design-notes.md`. This is a working reference, not user
+documentation: when the work lands, the rationale moves to the design notes and
+this file can be deleted.
 
-- **LangChain and LangGraph: implemented** (uncommitted at the time of writing),
-  with tests, README, examples and design notes, and verified against the real
-  instrumentor. Examples are in `agents_instrumentation`
-  (`agents/langchain/`, `agents/langgraph/`).
-- **CrewAI: not started.**
+1. [A simple `anthropic` key](#1-a-simple-anthropic-key)
+2. [Agno + Anthropic (and the Agno double count)](#2-agno--anthropic-and-the-agno-double-count)
+3. [CrewAI + Anthropic](#3-crewai--anthropic)
+4. [CrewAI + LangChain / LangGraph](#4-crewai--langchain--langgraph)
 
-This is a working reference for the implementation, not user documentation. When
-the work lands, the rationale moves to `docs/design-notes.md` (the LangChain and
-LangGraph part already has) and this file can be deleted.
+Findings were checked on 2026-10-09 with real Agno 3.1.2, CrewAI 1.15.26,
+`openinference-instrumentation-agno` 1.0.14, `-crewai` 1.1.20, `-anthropic`
+3.0.1 and `-openai` 0.1.64, against stub OpenAI and Anthropic servers. Versions
+will drift.
 
-Where the implementation differs from what this plan first said, the plan has
-been corrected in place: the OpenAI duplicate is a separate trace, not a child
-span (see Findings and Decision 2).
+## The rule all four follow
 
-## Goal
+No registry entry pairs an instrumentor it doesn't own. A framework entry lists
+only its own instrumentor, and relates to the provider keys (`openai`,
+`anthropic`) in one of three ways:
 
-Extend the curated registry in `src/argus/detection.py` so a bare
-`argus.init(project)` detects and instruments LangChain, LangGraph and CrewAI,
-the same way it already does for OpenAI Agents, Claude and Agno. Examples for
-each framework come later, in `agents_instrumentation`.
+| Framework's instrumentor...         | Entry declares                    | Keys                                              |
+| ----------------------------------- | --------------------------------- | ------------------------------------------------- |
+| records the model calls itself      | `supersedes` the provider keys    | `openai_agents`, `agno`, `langchain`, `langgraph` |
+| records structure only              | `companions`: the provider keys   | `crewai`                                          |
+| has no Python provider SDK under it | neither                           | `claude`                                          |
 
-## Findings (verified against PyPI and the instrumentor source)
+Explicit lists stay exact: never trimmed by supersession, never expanded by
+companions. In one sentence: *provider spans are on unless a detected framework
+already records the model calls.*
 
-Versions below are as of 2026-10-09 and will drift.
+Patching is process-wide, so supersession is too. In a mixed run, a
+structure-only framework (CrewAI) loses its LLM spans whenever a self-recording
+one is detected, and a raw client call goes untraced next to any self-recording
+framework. That is inherent, not an inconsistency. Naming the keys explicitly is
+the escape hatch.
 
-### LangChain and LangGraph share one instrumentor
-
-- There is **no** `openinference-instrumentation-langgraph` on PyPI. Only
-  `openinference-instrumentation-langchain` (0.1.78) exists.
-- `LangChainInstrumentor` wraps
-  `langchain_core.callbacks.BaseCallbackManager.__init__` and adds its tracer as
-  an inheritable handler. LangGraph is built on `langchain-core`'s callback
-  system, so the same handler traces graph runs. The package README states
-  LangChain 1.x is built on LangGraph, and the tracer has LangGraph-specific
-  handling (`on_interrupt`, streamed-message fallbacks, `RemoveMessage`).
-- LangGraph can be installed without the `langchain` package, but never without
-  `langchain-core`. So the correct detection signal is **`langchain_core`**, not
-  `langchain`. Detecting on `langchain` would miss `langgraph` + `langchain-openai`
-  setups, which are common.
-- The instrumentor patches a class method, not a free function, so
-  `free_functions=()`. No stale-binding risk, and `argus.bindings` needs no
-  change.
-- The tracer checks `_SUPPRESS_INSTRUMENTATION_KEY`, so `argus.blindspot`
-  should work (to be verified across LangGraph's thread boundaries).
-- `langchain-openai` calls the OpenAI SDK underneath. Running
-  `OpenAIInstrumentor` alongside reports each model call twice with the same
-  token counts, which double-counts on a backend. Verified with a real
-  `ChatOpenAI`: the OpenAI span is **not** a child of LangChain's but a separate
-  root trace, because `OpenInferenceTracer` never attaches its spans to the
-  OpenTelemetry context (see its comment in `_tracer.py::_start_trace`). The run is
-  double-counted and split.
-- Requires Python `>=3.10,<3.15`.
-
-### CrewAI is separate and does not emit LLM spans by default
-
-- `openinference-instrumentation-crewai` (1.1.20) wraps class methods:
-  `Crew.kickoff`, `Task._execute_core`, `Agent.kickoff`, `Flow.kickoff`,
-  `Flow.kickoff_async`, `Flow._execute_method`, `BaseTool.run`, `Tool.run`, and
-  the legacy memory classes where they still exist. It also patches
-  `Agent._execute_without_timeout` and
-  `CrewAgentExecutor._execute_single_native_tool_call` to propagate context into
-  the timeout thread. `free_functions=()`.
-- In the default (wrapper) mode it produces crew, task, agent and tool spans but
-  **no LLM spans**; its README says to instrument the LLM client separately.
-- CrewAI 1.x depends on `openai` (`>=2.30,<3`), so it pairs with
-  `OpenAIInstrumentor`, exactly like Agno.
-- An alternative `use_event_listener=True` mode creates LLM spans from CrewAI's
-  `LLMCall*` events for any provider. Its README recommends it only for
-  AMP/low-code usage and calls wrapper mode the recommended path for standard
-  Python apps.
-- Requires Python `>=3.10,<3.14`.
-
-### Dependency conflict (matters for the examples step)
-
-As of today `crewai` requires `openai<3` while `openai-agents` requires
-`openai>=3`, and `agents_instrumentation/requirements.txt` pins
-`openai==3.11.0`. CrewAI cannot share a venv with the current examples
-requirements. Consequences:
-
-- Do **not** add an `[all]` extra to Argus.
-- The examples repo needs a separate environment or requirements file per
-  framework.
-- The examples repo's `.venv` is already out of step with its
-  `requirements.txt` (`openai 1.109.1`, `argus-trace 0.7.0` installed).
-
-## Decisions
-
-1. **Add `langgraph` as an alias key alongside `langchain`.**
-   Both resolve to the same `LangChainInstrumentor`; `resolve_instrumentors`
-   already dedupes by class, so enabling both yields one instrumentor. The alias
-   lets `instrument="langgraph"` and `argus-trace[langgraph]` work and lets the
-   README list LangGraph honestly, for about six lines. Without it, a user typing
-   `langgraph` gets an "Unknown instrument key" error. Document that the two
-   names enable the same instrumentor.
-
-2. **LangChain and LangGraph supersede the standalone `openai` key.**
-   Avoids the duplicate-LLM-span and double-counted-token problem above. Known
-   cost: a LangGraph node that calls the raw `openai` client directly goes
-   untraced. Escape hatch: `instrument=["langchain", "openai"]` (explicit lists
-   are not subject to supersession), which accepts the duplication for every
-   LangChain model call. Document both.
-
-3. **CrewAI uses wrapper mode paired with `OpenAIInstrumentor`**, not event-listener
-   mode. Known limitation: LLM spans exist only for OpenAI-backed crews.
-   Anthropic, Gemini or LiteLLM crews get structure spans but no LLM spans.
-   Fixing that needs conditional pairing (add instrumentor X only if module Y is
-   present), which the registry cannot express today. Deferred; document the
-   limit.
-
-4. **Two PRs.** LangChain + LangGraph first, CrewAI second, because CrewAI
-   carries the LLM-coverage and environment questions. One `feat:` commit per
-   framework so the Commitizen changelog reads cleanly.
-
-## Implementation: Argus
-
-### `src/argus/detection.py`
-
-- Extend `InstrumentKey` with `"langchain"`, `"langgraph"`, `"crewai"`.
-- Add registry entries:
+Target registry:
 
 ```python
-_Framework(
-    "langchain",
-    "langchain_core",
-    ("openinference.instrumentation.langchain:LangChainInstrumentor",),
-    supersedes=("openai",),
-),
-_Framework(
-    "langgraph",
-    "langgraph",
-    ("openinference.instrumentation.langchain:LangChainInstrumentor",),
-    supersedes=("openai",),
-),
-_Framework(
-    "crewai",
-    "crewai",
-    (
-        "openinference.instrumentation.crewai:CrewAIInstrumentor",
-        "openinference.instrumentation.openai:OpenAIInstrumentor",
-    ),
-    supersedes=("openai",),
-),
+_Framework("openai_agents", "agents", (OPENAI_AGENTS,), supersedes=("openai",)),
+_Framework("claude", "claude_agent_sdk", (CLAUDE_AGENT_SDK,), free_functions=("query",)),
+_Framework("agno", "agno", (AGNO,), supersedes=("openai", "anthropic")),
+_Framework("langchain", "langchain_core", (LANGCHAIN,), supersedes=("openai", "anthropic")),
+_Framework("langgraph", "langgraph", (LANGCHAIN,), supersedes=("openai", "anthropic")),
+_Framework("crewai", "crewai", (CREWAI,), companions=("openai", "anthropic")),
+_Framework("anthropic", "anthropic", (ANTHROPIC,)),
+_Framework("openai", "openai", (OPENAI,)),
 ```
 
-- Comment each entry: why `langchain_core` is the detector, why the `langgraph`
-  alias exists, why `supersedes=("openai",)` is load-bearing for LangChain but
-  cosmetic for CrewAI (which pairs the OpenAI instrumentor itself, as Agno does).
-- Keep `openai` last in the registry as today. Registry order is application
-  order, and it is not what prevents double instrumentation.
-- No structural change to `_Framework`, `_auto_keys` or `resolve_instrumentors`
-  is expected. If implementation shows otherwise, stop and revisit.
+## 1. A simple `anthropic` key
 
-### `pyproject.toml`
+For a script calling the Anthropic Python SDK directly, as `openai` is for the
+OpenAI one.
 
-```toml
-langchain = ["openinference-instrumentation-langchain"]
-langgraph = ["openinference-instrumentation-langchain"]
-crewai = [
-    "openinference-instrumentation-crewai",
-    "openinference-instrumentation-openai",
-]
-```
+**Findings**
 
-- As with the existing extras, these install the instrumentor only, not the
-  framework itself.
-- Consider a `python_version < "3.14"` marker on the `crewai` extra.
-- No `[all]` extra (see the dependency conflict).
+- `openinference-instrumentation-anthropic` wraps class methods
+  (`anthropic.resources.messages.Messages.create`, `.stream`, `.parse`, their
+  async and `beta` counterparts), so `free_functions=()`. It is in the
+  `openinference_instrumentor` entry-point group, so `instrument="all"` already
+  reaches it. Python `>=3.10,<3.15`.
+- `langchain-anthropic` depends on `anthropic`, and `ChatAnthropic` calls it, so
+  this is the same duplication as `ChatOpenAI` (a second LLM span, in a separate
+  trace). `langchain` and `langgraph` must supersede `anthropic` too.
+- The Claude Agent SDK (`claude`) doesn't depend on `anthropic`. It drives the
+  Claude Code CLI as a subprocess, so the model calls happen in another process.
+  No overlap and no supersession either way. A script using both the Agent SDK
+  and the raw client gets both keys, which is correct.
+- The OpenAI Agents SDK reaches non-OpenAI models through LiteLLM, which doesn't
+  call the Anthropic SDK. It is believed to need no `anthropic` supersession;
+  verify during implementation.
 
-### Tests
+**Changes**
 
-The fixture in `tests/test_detection.py` builds fake modules from the registry,
-so new entries get stand-ins automatically. Add or extend:
+- `detection.py`: `"anthropic"` in `InstrumentKey`. Entry `("anthropic",
+  "anthropic", ("openinference.instrumentation.anthropic:AnthropicInstrumentor",))`,
+  placed with `openai` at the end. `langchain` and `langgraph` gain `"anthropic"`
+  in `supersedes`.
+- `pyproject.toml`: `anthropic = ["openinference-instrumentation-anthropic"]`.
+- Docs: README table row, install line, "eight keys". One sentence on the names:
+  `claude` is the Claude Agent SDK, `anthropic` is the Anthropic API SDK. A short
+  "Anthropic client, used directly" section in `docs/examples.md`, next to the
+  OpenAI one. The LangChain paragraphs mention `ChatAnthropic` alongside
+  `ChatOpenAI`.
 
-- `langchain_core` in `sys.modules` selects `LangChainInstrumentor`.
-- `langchain` and `langgraph` detected together yield exactly one instrumentor.
-- `langchain` + `openai` detected yields only the LangChain instrumentor
-  (`_auto_keys` level and the end-to-end `TestCuratedDetectionForReal` level).
-- `crewai` selects `CrewAIInstrumentor` + `OpenAIInstrumentor` and drops
-  standalone `openai`.
-- `TestClassesForKeys`: the exact paths each new key resolves to.
-- The existing invariants (`TestInstrumentVocabulary`, `TestSupersession`,
-  "every framework turns something on") should pass with no edits. If they
-  don't, that is a signal to investigate, not to loosen.
-- `tests/test_session.py` / `test_bindings.py`: confirm nothing assumes four
-  keys. Add a check that the new frameworks declare no free functions.
+**Tests**
 
-### Docs
+- `anthropic` alone → `[AnthropicInstrumentor]`. `TestClassesForKeys` pins its
+  path.
+- LangChain / LangGraph + `anthropic` → LangChain only, at the `_auto_keys` level
+  and end to end. Explicit `["langchain", "anthropic"]` keeps both.
+- `test_bindings.py`: `anthropic` declares no free functions.
+- `test_session.py`: the no-instrumentors warning lists `anthropic`.
 
-- `README.md`: the instrumentor table, the install block (new extras), the
-  `instrument` argument row, and the sentence "Of the four keys, `claude` is
-  currently the only one with a free function...", which becomes seven keys.
-  Note that `langchain` and `langgraph` enable the same instrumentor, that
-  LangChain supersedes `openai` (with the escape hatch), and the CrewAI
-  OpenAI-only LLM-span limit.
-- `docs/examples.md`: one section per framework.
-- `docs/design-notes.md`, under "Curated detection over entry points": one
-  instrumentor with several names; detecting on `langchain_core`; why LangChain
-  supersedes `openai`; why CrewAI stays in wrapper mode.
-- `CHANGELOG.md` is generated by `cz bump` from the commit messages. Don't edit
-  it by hand.
+**Verify:** a raw `anthropic` client call gives one `messages.create` LLM span
+with tokens. `ChatAnthropic` under LangChain gives one LLM span.
 
-### Quality gates
+## 2. Agno + Anthropic (and the Agno double count)
 
-`black`, `isort`, `ruff check`, `mypy` and `pytest` all clean, per the README.
+**Findings**
 
-## Verification with real runs
+- `AgnoInstrumentor` walks every module under `agno.models` and wraps each model
+  class's `invoke` / `ainvoke` / `invoke_stream` / `ainvoke_stream`. It emits an
+  LLM span with `llm.provider`, model name and token counts, for every provider.
+  The registry comment "Agno's instrumentor does not cover OpenAI calls" is wrong.
+- So the released `agno` entry, which pairs `OpenAIInstrumentor`, double-counts.
+  `agents_instrumentation/agents/agno/agent_with_tool_oai.py`'s shape (`arun`, a
+  tool, a bare `init`):
 
-These need the real frameworks, so they belong to the examples step in
-`agents_instrumentation`, each framework in its own environment.
+  ```text
+  Agent.arun [AGENT]
+    OpenAIChat.ainvoke [LLM] provider=OpenAI prompt_tokens=11
+      ChatCompletion [LLM] prompt_tokens=11       <- paired OpenAIInstrumentor
+    get_weather [TOOL]
+    OpenAIChat.ainvoke [LLM] provider=OpenAI prompt_tokens=11
+      ChatCompletion [LLM] prompt_tokens=11       <- again
+  ```
 
-LangChain / LangGraph:
+  The spans nest, but a backend summing tokens over LLM spans counts each call
+  twice.
+- An Agno agent on `Claude` already gets exactly one LLM span (`Claude.invoke`,
+  provider=Anthropic, tokens). Turning on the Anthropic instrumentor as well
+  (tried via `instrument="all"`) nests a second `messages.create` LLM span with
+  the same tokens. So Agno + Anthropic needs **no** pairing: it needs Agno to
+  supersede `anthropic`.
+- The model wrapping already exists in `openinference-instrumentation-agno`
+  0.1.5, so no version floor is needed. The instrumentor's README instruments
+  Agno alone.
+- Agno has no hard dependency on `openai` or `anthropic`; `import agno` loads
+  neither.
 
-- `ChatOpenAI` plus a tool: LLM and tool spans appear, with **no** duplicate
-  OpenAI span. (Checked once against a local stub server: auto-detection gives one
-  LLM span; forcing both gives a second, separate trace.)
-- A `StateGraph` with a node calling `ChatOpenAI`; a prebuilt agent (LangChain 1.x
-  `create_agent` or LangGraph's `create_react_agent`).
-- Parallel branches (LangGraph's thread pool): parent/child nesting is correct.
-- Async, and streaming (`stream` / `astream`).
-- A node that raises: the run writes an `.error` trace file.
-- `argus.blindspot` suppresses spans across LangGraph's thread boundaries.
+**Changes**
 
-CrewAI:
+- `detection.py`: the `agno` entry becomes `AgnoInstrumentor` alone, with
+  `supersedes=("openai", "anthropic")`. That supersession is load-bearing now, so
+  rewrite the "Cosmetic" comment with the finding.
+- `pyproject.toml`: the `agno` extra drops `openinference-instrumentation-openai`.
+- **What users see:** an Agno run on OpenAI loses the nested `ChatCompletion`
+  span. Coverage is unchanged and tokens are counted once. The raw request
+  parameters that span carried are available through `instrument=["agno",
+  "openai"]`, accepting the double count. `instrument="agno"` now resolves to one
+  instrumentor. A raw `openai` / `anthropic` client call inside an Agno script
+  goes untraced, the same trade as LangChain's. Agno + LangChain stops
+  duplicating `ChatOpenAI` calls as a side effect.
+- Docs: README table row (Agno → `AgnoInstrumentor`) and the behaviour change.
+  The `docs/examples.md` Agno section: one instrumentor, any model, Claude
+  included. Design notes: why the pair went.
 
-- A crew with a tool: LLM spans nest under agent and task spans and carry token
-  counts.
-- Context propagates through CrewAI's timeout thread.
-- `Flow` execution.
-- `argus.blindspot` behaves.
-- `argus.reset()` followed by `init` re-instruments cleanly.
+**Tests**
+
+- Agno alone, Agno + `openai`, Agno + `anthropic` → `[AgnoInstrumentor]`, end to
+  end and at `_auto_keys`.
+- `TestClassesForKeys`: `agno` → one path.
+- Rewrite the tests that pin the pair: `test_a_detected_framework_turns_on_its_registry_entry`
+  (expects Agno + OpenAI), `test_resolves_each_path_for_a_known_key`, and
+  `test_agno_also_supersedes_standalone_openai` (its "cosmetic" comment).
+- Explicit `["agno", "openai"]` keeps both.
+
+**Verify:** `agent_with_tool_oai.py`'s shape gives one LLM span per model call;
+the same on Claude.
+
+**Commit:** this changes what a released key turns on, so use `fix:` with a
+`BREAKING CHANGE:` footer. Under `major_version_zero`, Commitizen bumps the
+minor.
+
+## 3. CrewAI + Anthropic
+
+**Findings**
+
+- CrewAI's instrumentor records structure only. LLM spans come from the provider
+  instrumentors.
+- Its native Anthropic provider (`anthropic/...` and `claude-...` models,
+  `crewai[anthropic]`) calls the Anthropic SDK. But CrewAI imports that provider
+  lazily, in `LLM._get_native_provider`, when an agent with a Claude model is
+  built. In the usual script order (imports, then `argus.init`, then agents),
+  `anthropic` is **not** in `sys.modules` when `init` runs. And because `crewai`
+  is loaded, the importability fallback doesn't run. A plain `anthropic` key
+  would therefore never be detected for a Claude-backed crew.
+- `import crewai` does import `openai` (a hard dependency), which is why OpenAI
+  crews work today through the `openai` key.
+
+**Changes**
+
+This is a structural change to the registry, the "stop and revisit" the earlier
+plan anticipated: a new field and one extra step in `_auto_keys`. Supersession
+itself is unchanged.
+
+- `_Framework` gains `companions: tuple[InstrumentKey, ...] = ()`: provider keys a
+  detected framework turns on alongside itself, checked by **importability**
+  (`find_spec`) rather than `sys.modules`, because the framework imports its
+  providers after `init`. Document it next to `supersedes`.
+- `_auto_keys`: after finding candidates, add each detected framework's
+  companions that aren't already candidates and pass the guard. Then apply
+  supersession to the whole set as today, and return it in registry order.
+- **Guard:** add a companion only if its detector (the provider SDK) **and** its
+  instrumentor module are importable. The SDK can be installed without the
+  instrumentor (pulled in by something else), and `_load` would otherwise raise
+  out of `init` for a key nobody asked for. A companion whose instrumentor is
+  missing is skipped.
+- `crewai` entry: `companions=("openai", "anthropic")`. `openai` is redundant
+  today, but listing it says what the entry means, and stops depending on
+  CrewAI's import graph. Rewrite the entry comment around companions and the
+  lazy provider import.
+- `pyproject.toml`: the `crewai` extra adds
+  `openinference-instrumentation-anthropic`, so the guard is a safety net, not
+  the normal path.
+- **Cost:** with `anthropic` installed but the crew on OpenAI, the Anthropic
+  instrumentor patches a client that is never called. Harmless.
+- **Explicit lists are not expanded**, which keeps "explicit means exact".
+  `instrument="crewai"` still has no LLM instrumentor; the docs say
+  `["crewai", "openai"]` / `["crewai", "anthropic"]`. **Open question:**
+  expanding companions for explicit keys would remove that footgun, at the price
+  of explicit no longer meaning exact.
+- Docs: README CrewAI paragraph (Claude crews now get LLM spans; Gemini, Bedrock
+  and LiteLLM still don't). The `docs/examples.md` CrewAI section, with a Claude
+  example. Rewrite the design-notes subsection "CrewAI: wrapper mode, OpenAI
+  through its own key" around companions, and add the rule above under "Curated
+  detection over entry points".
+
+**Tests**
+
+- End to end: `crewai` loaded, `anthropic` importable but not loaded → CrewAI +
+  Anthropic (+ OpenAI).
+- `_auto_keys`: companions found by importability while `sys.modules` has only
+  `crewai`. A companion skipped when its SDK is importable but its instrumentor
+  isn't. Registry order kept.
+- `TestSupersession` gains companion invariants: every companion is a known key;
+  no framework both supersedes and companions the same key; a companion has no
+  companions of its own (one level only); no framework is its own companion.
+- Explicit `instrument="crewai"` → `[CrewAIInstrumentor]` (not expanded).
+
+**Verify:** a crew on Claude, agents built after `init`, bare `init` →
+`messages.create` LLM spans nested under the task, with tokens.
+`instrument="all"` is unaffected (entry points, no companions).
+
+**Commit:** `feat: crewai turns on its provider instrumentors as companions`.
+
+## 4. CrewAI + LangChain / LangGraph
+
+**Already done for OpenAI.** `crewai` doesn't pair `OpenAIInstrumentor`, so
+`langchain`'s supersession drops the `openai` key in a mixed run, and each
+`ChatOpenAI` call is reported once. This was verified with real CrewAI and
+`langchain-openai`. The crew's own OpenAI calls lose their LLM spans, and
+`instrument=["crewai", "langchain", "openai"]` restores them. Tests and docs are
+in place.
+
+**What the items above must preserve:**
+
+- Companions go through supersession. CrewAI + LangChain must drop **both**
+  companions, `openai` (as today) and `anthropic` (new, via item 1's
+  `supersedes`). Add the test: `crewai` + `langchain_core` loaded, `anthropic`
+  importable → LangChain + CrewAI only.
+- Update the existing tests and docs that name only `openai` in this
+  combination, and the escape hatch: `instrument=["crewai", "langchain",
+  "anthropic"]` for a Claude crew.
+
+**Verify:** a Claude crew plus a `ChatAnthropic` call: one LLM span for
+`ChatAnthropic`, none for the crew's model calls; the explicit list restores
+them.
+
+## Order and commits
+
+1, then 2, then 3. Item 4 is checked as part of 3. One commit each, so the
+changelog reads cleanly:
+
+- `feat: anthropic key for the Anthropic SDK used directly`
+- `fix: agno no longer pairs the OpenAI instrumentor` (`BREAKING CHANGE:`
+  footer)
+- `feat: crewai turns on its provider instrumentors as companions`
+
+`black`, `isort`, `ruff check`, `mypy` and `pytest` clean for each.
 
 ## Out of scope
 
-- Examples in `agents_instrumentation` (next step), including per-framework
-  environments.
-- Conditional instrumentor pairing for non-OpenAI CrewAI providers (Anthropic,
-  Gemini, LiteLLM).
-- An event-listener mode option for CrewAI.
-- Span scrubbing and redaction (already on the README roadmap).
-
-## Open risks
-
-- LangChain spans are not attached to the OpenTelemetry context, so any span
-  started inside a LangChain node (a raw client call, a manual span) does not
-  nest under it. CrewAI uses a different mechanism, so check that its OpenAI spans
-  do nest under its agent and task spans.
-
-- Version drift: the instrumentors and frameworks move quickly, and the Python
-  ceilings (<3.14 for CrewAI, <3.15 for LangChain) may tighten.
-- Detecting on `langchain_core` instruments any program that imports it, such as
-  a library that pulls it in transitively. Detection prefers `sys.modules`, so
-  only an actual import triggers it, but it is broader than detecting on
-  `langchain`.
-- On Python 3.10, LangChain async callbacks need explicit config passing in some
-  cases. Argus supports 3.10; the examples run on 3.13.
+- Gemini, Bedrock and LiteLLM provider keys. Each is one key plus a line in
+  `crewai`'s companions and in the self-recording frameworks' `supersedes`, once
+  their instrumentors are checked.
+- Dropping a provider LLM span only when it nests under a framework's LLM span
+  (a span-processor dedupe). It would let Agno keep the raw OpenAI span without
+  double counting, but can't help LangChain, whose spans don't nest.

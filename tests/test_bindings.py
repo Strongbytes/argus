@@ -424,13 +424,15 @@ class TestTheRealRegistry:
         # here would warn about an import order that is fine.
         #
         # LangChain and LangGraph are no different: the instrumentor wraps
-        # ``BaseCallbackManager.__init__``, a method.
+        # ``BaseCallbackManager.__init__``, a method. CrewAI's wraps
+        # ``Crew.kickoff``, ``Task._execute_core`` and the like, all methods too.
         for key in (
             "openai_agents",
             "agno",
             "openai",
             "langchain",
             "langgraph",
+            "crewai",
         ):
             assert detection._BY_KEY[key].free_functions == ()
 

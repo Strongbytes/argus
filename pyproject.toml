@@ -34,6 +34,15 @@ agno = [
 # use.
 langchain = ["openinference-instrumentation-langchain"]
 langgraph = ["openinference-instrumentation-langchain"]
+# The CrewAI instrumentor emits no LLM spans of its own; they come from the OpenAI
+# one, which the curated ``openai`` key turns on beside it (CrewAI imports
+# ``openai``), so the extra installs both. No ``python_version`` marker for the
+# instrumentor's ``<3.14`` ceiling: CrewAI has the same one, and a marker would
+# turn the install error on 3.14 into an extra that quietly installs nothing.
+crewai = [
+    "openinference-instrumentation-crewai",
+    "openinference-instrumentation-openai",
+]
 # Matches the curated ``openai`` key, for a script calling the OpenAI client
 # directly rather than through an agent framework.
 openai = ["openinference-instrumentation-openai"]

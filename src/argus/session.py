@@ -17,6 +17,7 @@ of the provider's atexit shutdown") for why it is built this way.
 from __future__ import annotations
 
 import atexit
+import os
 import sys
 import warnings
 from collections.abc import Sequence
@@ -24,6 +25,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Literal
 
+from opentelemetry.sdk.environment_variables import OTEL_SDK_DISABLED
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import (
     ReadableSpan,
@@ -104,6 +106,29 @@ def _warn_no_instrumentors() -> None:
         f"{sorted(_BY_KEY)}. Pass instrument= with one of those keys "
         "(or instrument=[] to silence this warning), or install a recognized "
         "framework.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
+def _warn_if_sdk_disabled() -> None:
+    """Warn that ``OTEL_SDK_DISABLED`` has switched the OpenTelemetry SDK off.
+
+    The SDK reads it when a :class:`TracerProvider` is built, and a disabled
+    provider hands out no-op tracers: the instrumentors still turn on, but no
+    span is ever recorded and no file is written. It is OpenTelemetry's own off
+    switch, so it is honoured rather than overridden -- but it is also one of the
+    variables CrewAI accepts for turning off its telemetry, which makes setting
+    it without meaning to switch Argus off an easy mistake. Parsed exactly as the
+    SDK parses it, and checked after ``.env`` is loaded, where it may come from.
+    """
+    if os.environ.get(OTEL_SDK_DISABLED, "").lower().strip() != "true":
+        return
+    warnings.warn(
+        f"{OTEL_SDK_DISABLED}=true switches off the OpenTelemetry SDK Argus "
+        "runs on, so this run will record no spans and write no trace files. "
+        "Unset it (check .env too) for Argus to record. If it was set to turn "
+        "off CrewAI's telemetry, use CREWAI_DISABLE_TELEMETRY=true instead.",
         RuntimeWarning,
         stacklevel=3,
     )
@@ -490,9 +515,10 @@ def init(
     deliberately. So does a name a caller imported *out* of a framework before
     this call -- ``from claude_agent_sdk import query`` -- which keeps the
     un-instrumented function and would otherwise go untraced in silence (see
-    :mod:`argus.bindings`). See ``docs/design-notes.md`` ("One session per
-    process", "Curated detection over entry points", "Stale bindings from an
-    import before init").
+    :mod:`argus.bindings`). ``OTEL_SDK_DISABLED=true`` warns too: it switches
+    the OpenTelemetry SDK off, and the run then records nothing. See
+    ``docs/design-notes.md`` ("One session per process", "Curated detection over
+    entry points", "Stale bindings from an import before init").
 
     Args:
         project: Argus's logical run umbrella, stamped on every span as
@@ -555,6 +581,7 @@ def init(
     otlp_config = _resolve_otlp_config(otlp)
 
     _load_dotenv()
+    _warn_if_sdk_disabled()
 
     # shutdown_on_exit=False is load-bearing: the provider's own atexit handler
     # would otherwise run before Argus's flush (atexit is LIFO) and tear the

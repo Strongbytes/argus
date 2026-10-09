@@ -491,6 +491,7 @@ class TestNoInstrumentorsWarning:
         assert "agno" in message
         assert "langchain" in message
         assert "langgraph" in message
+        assert "crewai" in message
         assert "openai" in message
 
     def test_no_warning_when_instrument_is_explicitly_empty(
@@ -531,6 +532,101 @@ class TestNoInstrumentorsWarning:
         # The init() line is where the fix goes, so that is what the warning has
         # to name. Nothing else fails when a refactor puts another frame between
         # the two, which is why the stacklevel is asserted rather than commented.
+        assert record[0].filename == __file__
+
+
+class TestSdkDisabledWarning:
+    """``OTEL_SDK_DISABLED=true`` is honoured, but never in silence.
+
+    It is OpenTelemetry's own off switch, and also one of the variables CrewAI
+    accepts for turning off its telemetry -- so a run can lose every span to a
+    line someone added for a different library.
+    """
+
+    VAR = "OTEL_SDK_DISABLED"
+
+    @pytest.fixture(autouse=True)
+    def sdk_enabled_by_default(self, monkeypatch):
+        monkeypatch.delenv(self.VAR, raising=False)
+
+    def test_warns_and_the_run_really_records_nothing(
+        self, monkeypatch, use_instrumentors, recording_exporter
+    ):
+        use_instrumentors()
+        monkeypatch.setenv(self.VAR, "true")
+
+        with pytest.warns(RuntimeWarning, match="record no spans"):
+            session = argus.init("proj", exporters=[recording_exporter])
+        session.provider.get_tracer("test").start_span("work").end()
+        session.flush()
+
+        # What the warning claims, shown rather than assumed: the provider is
+        # built, the span is started, and nothing reaches the exporter.
+        assert recording_exporter.exported_spans == []
+
+    def test_the_message_names_the_crewai_alternative(
+        self, monkeypatch, use_instrumentors, recording_exporter
+    ):
+        use_instrumentors()
+        monkeypatch.setenv(self.VAR, "true")
+
+        with pytest.warns(RuntimeWarning) as record:
+            argus.init("proj", exporters=[recording_exporter])
+
+        message = str(record[0].message)
+        assert self.VAR in message
+        assert "CREWAI_DISABLE_TELEMETRY=true" in message
+
+    @pytest.mark.parametrize("value", ["TRUE", " true "])
+    def test_parsed_the_way_the_sdk_parses_it(
+        self, value, monkeypatch, use_instrumentors, recording_exporter
+    ):
+        # Case and surrounding whitespace are ignored by the SDK, so a looser or
+        # stricter reading here would warn about a run that records, or miss
+        # one that doesn't.
+        use_instrumentors()
+        monkeypatch.setenv(self.VAR, value)
+
+        with pytest.warns(RuntimeWarning, match=self.VAR):
+            argus.init("proj", exporters=[recording_exporter])
+
+    @pytest.mark.parametrize("value", ["false", "1", ""])
+    def test_no_warning_when_the_sdk_stays_on(
+        self, value, monkeypatch, use_instrumentors, recording_exporter, recwarn
+    ):
+        # The SDK treats anything but "true" as enabled -- "1" included.
+        use_instrumentors()
+        monkeypatch.setenv(self.VAR, value)
+
+        argus.init("proj", exporters=[recording_exporter])
+
+        assert [w for w in recwarn if self.VAR in str(w.message)] == []
+
+    def test_a_value_from_dotenv_is_caught(
+        self, monkeypatch, use_instrumentors, recording_exporter
+    ):
+        # CrewAI's docs keep the variable in .env, which init loads before it
+        # builds the provider -- so the check has to come after the load.
+        use_instrumentors()
+        monkeypatch.setattr(os, "environ", dict(os.environ))
+        monkeypatch.setattr(
+            session_module,
+            "_load_dotenv",
+            lambda: os.environ.__setitem__(self.VAR, "true"),
+        )
+
+        with pytest.warns(RuntimeWarning, match=self.VAR):
+            argus.init("proj", exporters=[recording_exporter])
+
+    def test_the_warning_points_at_the_caller(
+        self, monkeypatch, use_instrumentors, recording_exporter
+    ):
+        use_instrumentors()
+        monkeypatch.setenv(self.VAR, "true")
+
+        with pytest.warns(RuntimeWarning) as record:
+            argus.init("proj", exporters=[recording_exporter])
+
         assert record[0].filename == __file__
 
 

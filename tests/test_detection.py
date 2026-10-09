@@ -332,6 +332,57 @@ class TestCuratedDetectionForReal:
             "OpenAIInstrumentor",
         ]
 
+    def test_a_crew_gets_its_llm_spans_from_the_openai_key(
+        self, frameworks_in_use
+    ):
+        # ``import crewai`` imports ``openai``, so this is what a crew looks
+        # like to detection. CrewAI's instrumentor emits no LLM spans; the
+        # OpenAI one, reached through its own key, supplies them.
+        frameworks_in_use("crewai", "openai")
+
+        result = detection.resolve_instrumentors(None)
+
+        assert [type(i).__name__ for i in result] == [
+            "CrewAIInstrumentor",
+            "OpenAIInstrumentor",
+        ]
+
+    def test_crewai_with_langchain_reports_chatopenai_calls_once(
+        self, frameworks_in_use
+    ):
+        # Why CrewAI does not pair the OpenAI instrumentor itself: as a key it
+        # stays subject to supersession, so LangChain drops it here exactly as
+        # it does without CrewAI. A pair would bring it back as a class, past
+        # that rule, and report every ``ChatOpenAI`` call twice.
+        frameworks_in_use("crewai", "langchain", "openai")
+
+        result = detection.resolve_instrumentors(None)
+
+        assert [type(i).__name__ for i in result] == [
+            "LangChainInstrumentor",
+            "CrewAIInstrumentor",
+        ]
+
+    def test_explicit_crewai_alone_has_no_llm_instrumentor(self):
+        # The documented cost of leaving the pairing to the ``openai`` key: an
+        # explicit selection names it too, as ``["crewai", "openai"]``.
+        result = detection.resolve_instrumentors("crewai")
+
+        assert [type(i).__name__ for i in result] == ["CrewAIInstrumentor"]
+
+    def test_explicit_keys_can_pair_crewai_and_langchain_with_openai(self):
+        # The escape hatch for a mixed run whose CrewAI agents call OpenAI
+        # natively, accepting the duplicate for each ``ChatOpenAI`` call.
+        result = detection.resolve_instrumentors(
+            ["crewai", "langchain", "openai"]
+        )
+
+        assert [type(i).__name__ for i in result] == [
+            "CrewAIInstrumentor",
+            "LangChainInstrumentor",
+            "OpenAIInstrumentor",
+        ]
+
     def test_every_framework_on_its_own_turns_something_on(
         self, frameworks_in_use
     ):
@@ -426,6 +477,13 @@ class TestClassesForKeys:
             "openinference.instrumentation.langchain:LangChainInstrumentor"
         ]
 
+    def test_crewai_resolves_to_its_instrumentor_alone(self, monkeypatch):
+        monkeypatch.setattr(detection, "_load", lambda path: path)
+
+        assert detection._classes_for_keys(["crewai"]) == [
+            "openinference.instrumentation.crewai:CrewAIInstrumentor"
+        ]
+
 
 class TestLoad:
     """The lazy-import seam, run rather than stubbed.
@@ -507,6 +565,40 @@ class TestAutoKeys:
         )
 
         assert detection._auto_keys() == ["langchain", "langgraph"]
+
+    def test_crewai_keeps_the_openai_key(self, monkeypatch):
+        monkeypatch.setattr(
+            detection,
+            "_module_loaded",
+            lambda name: name in {"crewai", "openai"},
+        )
+
+        # Unlike agno, crewai supersedes nothing: the standalone key is where
+        # its LLM spans come from.
+        assert detection._auto_keys() == ["crewai", "openai"]
+
+    def test_crewai_keeps_the_openai_key_when_nothing_is_imported(
+        self, monkeypatch
+    ):
+        # The importability fallback reaches the same pair: ``openai`` is a hard
+        # dependency of CrewAI, so it is installed wherever crewai is.
+        monkeypatch.setattr(detection, "_module_loaded", lambda _name: False)
+        monkeypatch.setattr(
+            detection,
+            "_module_available",
+            lambda name: name in {"crewai", "openai"},
+        )
+
+        assert detection._auto_keys() == ["crewai", "openai"]
+
+    def test_langchain_drops_openai_from_a_crew(self, monkeypatch):
+        monkeypatch.setattr(
+            detection,
+            "_module_loaded",
+            lambda name: name in {"crewai", "langchain_core", "openai"},
+        )
+
+        assert detection._auto_keys() == ["langchain", "crewai"]
 
     def test_keeps_openai_when_it_is_the_only_framework(self, monkeypatch):
         monkeypatch.setattr(

@@ -736,6 +736,84 @@ client directly its span, and `instrument=["langchain", "openai"]` brings it bac
 of that duplication for every LangChain model call. The same property means a span
 of your own started inside a LangChain node will not nest under the node either.
 
+### CrewAI: wrapper mode, OpenAI through its own key
+
+`CrewAIInstrumentor` has two modes. The default wraps CrewAI's methods --
+`Crew.kickoff`, `Task._execute_core`, `Agent.kickoff`, `Flow`'s entry points, the
+tools' `run` -- and records crews, tasks, agents, tools and flows, but no model
+calls. `use_event_listener=True` instead builds every span, LLM spans included,
+from CrewAI's own events, for any provider. Argus uses the default. The
+instrumentor's README recommends it for a Python app and keeps the listener for
+CrewAI AMP, and `init` hands every instrumentor `tracer_provider` and nothing
+else, so there is no channel for per-instrumentor options to begin with.
+
+The LLM spans come from `OpenAIInstrumentor`. CrewAI depends on `openai`, its
+native OpenAI provider calls the SDK, and so do the OpenAI-compatible providers
+built on it (OpenRouter, DeepSeek, Ollama, vLLM). A crew on Anthropic, Gemini,
+Bedrock or LiteLLM gets its structure spans and no LLM spans. Covering those
+means turning an instrumentor on only when its provider is in use -- the
+Anthropic one when `anthropic` is imported, say -- which an entry cannot express:
+`instrumentors` is unconditional. That is deferred rather than worked around, and
+the README states the limit.
+
+Unlike Agno's entry, `crewai`'s doesn't list `OpenAIInstrumentor`. It doesn't
+need to: `import crewai` imports `openai`, and `openai` is a hard dependency, so
+auto-detection finds the `openai` key whether it reads `sys.modules` or falls
+back to importability. A CrewAI-only run ends up with the same two instrumentors
+either way. The difference shows when LangChain is in the run too, which CrewAI's
+LangGraph agent adapter makes a real combination. Supersession drops keys, not
+classes. A pair names its classes directly, so it would bring `OpenAIInstrumentor`
+back past `langchain`'s `supersedes=("openai",)`, and every `ChatOpenAI` call
+would be reported twice. As a key, `openai` is dropped there as in any other
+LangChain run. The CrewAI agents' own OpenAI calls then go untraced, the same
+trade LangChain already makes for a node calling the raw client, with the same
+escape hatch: `instrument=["crewai", "langchain", "openai"]`. Losing those spans
+is the lesser failure, since a duplicate double-counts tokens and splits the
+trace, while a gap only leaves something out. With a pair, nobody could choose
+otherwise.
+
+The cost is that an explicit `instrument="crewai"` turns on no LLM instrumentor,
+because nothing is auto-detected for an explicit list. The README says to write
+`["crewai", "openai"]`. Making supersession drop classes as well would have kept
+the pairing, but it is a structural change to the registry. It would also force
+the same trade with no way out, and silently change Agno's behaviour. Agno still
+pairs, and so still has the gap alongside LangChain; moving it to the same shape
+would change what the released `instrument="agno"` turns on, so that is left as a
+separate decision.
+
+Unlike LangChain's, CrewAI's wrappers start their spans as current, so the OpenAI
+span nests under the task that made the call, and a span of your own
+started inside a tool does too. CrewAI runs native tool calls, and an agent that
+has a timeout, on worker threads, which would lose the context; the instrumentor
+patches both paths to copy the context across. Every wrapper also checks
+OpenTelemetry's suppression flag, which is what `blindspot` sets. All of this was
+checked with real CrewAI 1.15 against a stub OpenAI server: one trace, the LLM
+and tool spans under the task with token counts, a `Flow` nesting its crew, nothing
+recorded under a `blindspot`, and a clean re-instrument after `reset`. A crew
+plus a `ChatOpenAI` call in one run reported the `ChatOpenAI` call once and the
+crew without LLM spans; with all three keys named, the crew's model calls were
+back and the `ChatOpenAI` call appeared twice, the second as a trace of its own.
+
+CrewAI's own telemetry runs on a private `TracerProvider`. It never installs a
+global one, so it doesn't collide with Argus's. Its opt-out does:
+`OTEL_SDK_DISABLED=true` is one of the variables CrewAI honours, and it makes
+every SDK `TracerProvider` hand out no-op tracers, Argus's included. The
+instrumentors still turn on and spans are still started, so nothing looks
+wrong until the run ends with no files. `init` therefore warns when the variable
+is set. It doesn't override it, because the variable is OpenTelemetry's own off
+switch and someone may set it deliberately. The check parses the value exactly
+as the SDK does (case and surrounding whitespace ignored, anything but `true`
+meaning on), runs after `.env` is loaded, where CrewAI's docs suggest keeping
+it, and is not CrewAI-specific, since a run with only spans of your own goes
+dark just the same. The message points to `CREWAI_DISABLE_TELEMETRY=true`, which
+turns off CrewAI's alone.
+
+Two packaging consequences. The `crewai` extra carries no `python_version`
+marker for the instrumentor's `<3.14` ceiling: CrewAI has the same ceiling, and a
+marker would turn a clear resolver error on 3.14 into an extra that quietly
+installs nothing. There is also no `[all]` extra, because the frameworks don't
+co-install: CrewAI pins `openai<3` and the OpenAI Agents SDK requires `openai>=3`.
+
 The keys are a type, not just documentation. `instrument=` is annotated with
 literals — `InstrumentKey` for the framework keys, `InstrumentStrategy` for
 `curated` and `all` — so an editor completes them and a type checker rejects
@@ -766,7 +844,7 @@ to the function it replaced, and the call `claude_agent_sdk.query(...)` picks
 that up because the attribute is read at call time. A method call
 (`Runner.run(...)`, `agent.arun(...)`) resolves through its class the same way,
 which is why importing a class before `init` is harmless — and why the OpenAI,
-OpenAI Agents, Agno, LangChain and LangGraph paths never had this problem.
+OpenAI Agents, Agno, LangChain, LangGraph and CrewAI paths never had this problem.
 
 A `from` import resolves nothing later. It copies the object:
 

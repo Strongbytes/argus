@@ -80,7 +80,13 @@ class Instrumentor(Protocol):
 
 #: A curated registry key, naming one framework Argus knows how to instrument.
 InstrumentKey = Literal[
-    "openai_agents", "claude", "agno", "openai", "langchain", "langgraph"
+    "openai_agents",
+    "claude",
+    "agno",
+    "openai",
+    "langchain",
+    "langgraph",
+    "crewai",
 ]
 
 #: A strategy for choosing keys, rather than a key itself.
@@ -195,6 +201,34 @@ _FRAMEWORKS: tuple[_Framework, ...] = (
         "langgraph",
         ("openinference.instrumentation.langchain:LangChainInstrumentor",),
         supersedes=("openai",),
+    ),
+    # CrewAI's instrumentor wraps methods only -- ``Crew.kickoff``,
+    # ``Task._execute_core``, ``Agent.kickoff``, ``Flow``'s entry points, the
+    # tools' ``run`` -- and in its default wrapper mode emits crew, task, agent
+    # and tool spans but no LLM spans. The instrumentor's other mode,
+    # ``use_event_listener=True``, builds LLM spans from CrewAI's own events for
+    # any provider, but its README keeps that for CrewAI AMP and recommends
+    # wrapper mode for a Python app. ``init`` passes ``tracer_provider`` and
+    # nothing else, so wrapper mode is what runs.
+    #
+    # The LLM spans come from the standalone ``openai`` key, deliberately not
+    # paired in here the way Agno pairs it, and so not superseded either.
+    # ``import crewai`` imports ``openai`` (a hard dependency, which its native
+    # OpenAI provider and the OpenAI-compatible ones built on it call), so
+    # detection finds both keys anyway. Leaving it a key keeps it subject to
+    # supersession: a run that also uses LangChain drops it as ``langchain``
+    # requires, rather than having a pair smuggle the OpenAI instrumentor past
+    # that rule and report every ``ChatOpenAI`` call twice. The cost is that an
+    # explicit ``instrument="crewai"`` gets no LLM spans -- ``["crewai",
+    # "openai"]`` does.
+    #
+    # A crew on Anthropic, Gemini, Bedrock or LiteLLM gets the structure spans
+    # and no LLM spans; covering those would mean turning an instrumentor on
+    # only when its provider is in use, which an entry cannot express.
+    _Framework(
+        "crewai",
+        "crewai",
+        ("openinference.instrumentation.crewai:CrewAIInstrumentor",),
     ),
     _Framework(
         "openai",

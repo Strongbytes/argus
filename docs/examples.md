@@ -18,6 +18,7 @@ the thing you're trying to do.
 - [A free function imported before init](#a-free-function-imported-before-init)
 - [Agno](#agno)
 - [LangChain and LangGraph](#langchain-and-langgraph)
+- [CrewAI](#crewai)
 - [The OpenAI client, used directly](#the-openai-client-used-directly)
 - [Choosing the instrumentors yourself](#choosing-the-instrumentors-yourself)
 - [Every argument at once](#every-argument-at-once)
@@ -228,6 +229,66 @@ Parallel branches, `ainvoke` and `stream`/`astream` all trace correctly, and a
 [`blindspot`](#keeping-a-scope-off-the-record) holds across parallel branches
 (which LangGraph runs on a thread pool) and `astream`.
 
+## CrewAI
+
+`pip install "argus-trace[crewai]"`:
+
+```python
+import argus
+from crewai import Agent, Crew, Task
+
+argus.init("research-crew")
+
+researcher = Agent(
+    role="Researcher",
+    goal="Summarize today's incidents.",
+    backstory="An on-call engineer who reads every alert.",
+    llm="gpt-4o-mini",
+)
+summary = Task(
+    description="Summarize today's incidents in three bullet points.",
+    expected_output="Three bullet points.",
+    agent=researcher,
+)
+
+Crew(agents=[researcher], tasks=[summary]).kickoff()
+```
+
+Two instrumentors turn on: `CrewAIInstrumentor` for the crew, its tasks, agents,
+tools and flows, and `OpenAIInstrumentor` for the model calls, which CrewAI's
+instrumentor doesn't record. The second comes from the `openai` key, detected
+because CrewAI imports `openai` itself. Model and tool calls nest under the task
+that made them, including the ones CrewAI runs on a worker thread (native tool
+calls, and an agent with `max_execution_time`). A `Flow` nests its crews under its
+own span.
+
+LLM spans therefore depend on the provider. OpenAI models get them, and so do the
+providers CrewAI reaches through the OpenAI SDK -- OpenRouter, DeepSeek, Ollama,
+vLLM and the like. A crew on Anthropic, Gemini, Bedrock or LiteLLM is still traced
+-- crew, tasks, agents, tools -- but without its model calls.
+
+If you name the instrumentors yourself, name both, or the model calls go
+untraced:
+
+```python
+argus.init("research-crew", instrument=["crewai", "openai"])
+```
+
+A crew that also uses [LangChain](#langchain-and-langgraph) -- a LangGraph agent
+through CrewAI's adapter, say -- is treated like any other LangChain run: `openai`
+is dropped, so each `ChatOpenAI` call is reported once, and the CrewAI agents'
+own OpenAI calls lose their LLM spans. To keep those, ask for all three and accept
+the duplicate for every `ChatOpenAI` call:
+
+```python
+argus.init("research-crew", instrument=["crewai", "langchain", "openai"])
+```
+
+To stop CrewAI's own anonymous telemetry, set `CREWAI_DISABLE_TELEMETRY=true`,
+not `OTEL_SDK_DISABLED=true`. CrewAI honours both, but the second switches off the
+whole OpenTelemetry SDK, including the tracer provider Argus sets up, and the run
+then records nothing. `init` warns if it finds it set.
+
 ## The OpenAI client, used directly
 
 No agent framework needed — `pip install "argus-trace[openai]"` traces plain
@@ -259,8 +320,8 @@ argus.init("no-framework", instrument=[])               # instrument nothing
 ```
 
 The curated keys are `openai_agents`, `claude`, `agno`, `langchain`, `langgraph`,
-and `openai` (the README
-has the table of what each detects and applies). A key that isn't one of them
+`crewai`, and `openai` (the README has the table of what each detects and
+applies). A key that isn't one of them
 raises `ValueError` listing the ones that are, so a typo fails at your `init`
 line instead of producing a run with nothing instrumented.
 
