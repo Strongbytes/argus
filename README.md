@@ -206,7 +206,7 @@ Four read-only properties and one method are the whole of it:
 | `project`     | The run umbrella passed to `init`.                                                                                                                            |
 | `instruments` | Class names of the instrumentors `init` turned on, e.g. `('OpenAIAgentsInstrumentor',)`.                                                                       |
 | `exporters`   | The sinks a flush drives, as a tuple.                                                                                                                         |
-| `flush()`     | Emit what has been captured so far. Safe to call repeatedly, and not terminal.                                                                                |
+| `flush()`     | Emit what has been captured so far. Safe to call repeatedly, and not terminal. `failed=True` tags the run as failed when you handled the exception yourself ([recipe](docs/examples.md#tagging-a-failure-you-handled-yourself)). |
 
 ```python
 session = argus.init("support-bot")
@@ -599,4 +599,5 @@ wrong: `claude_agent_sdk.query`. The class-based entry points -- including
 
 ## Roadmap
 
-- Span scrubbing/redaction hook before export.
+Planned work, and the decisions behind what has already landed, live in
+[ROADMAP.md](ROADMAP.md). Follow it for what comes next.

@@ -4,13 +4,17 @@ Why Argus works the way it does. This is the home for rationale: the trade-offs
 behind each decision, the failure modes they avoid, and the alternatives that
 were rejected.
 
-The other two places prose lives have narrower jobs, so each fact has exactly
-one home:
+The other places prose lives have narrower jobs, so each fact has exactly one
+home:
 
 - The [README](../README.md) is the user-facing guide — what the API is and how
   to use it.
+- [examples.md](examples.md) is the cookbook — complete, task-shaped code for
+  each use case.
 - Docstrings state the contract — what a function does, its arguments, what it
   returns and raises — and link here for the why.
+- [ROADMAP.md](../ROADMAP.md) is what is planned but not built yet; when an item
+  lands, its rationale moves here.
 
 ## Contents
 
@@ -577,7 +581,8 @@ exactly why the backend refused the spans.
 
 ## Swallowed errors are still audible
 
-Four places catch `Exception` and carry on. Three of them warn once they have:
+Four places in the session catch `Exception` and carry on. Three of them warn
+once they have:
 draining a stock exporter with `force_flush`, closing the exporters at exit, and
 uninstrumenting on `reset`. The reason is the same each time, and it is the right
 one — an exporter or an instrumentor Argus does not own must not take the host
@@ -937,7 +942,8 @@ to the function it replaced, and the call `claude_agent_sdk.query(...)` picks
 that up because the attribute is read at call time. A method call
 (`Runner.run(...)`, `agent.arun(...)`) resolves through its class the same way,
 which is why importing a class before `init` is harmless — and why the OpenAI,
-OpenAI Agents, Agno, LangChain, LangGraph and CrewAI paths never had this problem.
+Anthropic, OpenAI Agents, Agno, LangChain, LangGraph and CrewAI paths never had
+this problem.
 
 A `from` import resolves nothing later. It copies the object:
 

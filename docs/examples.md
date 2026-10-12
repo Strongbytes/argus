@@ -14,13 +14,13 @@ the thing you're trying to do.
 
 - [The shortest thing that works](#the-shortest-thing-that-works)
 - [OpenAI Agents SDK](#openai-agents-sdk)
+- [The OpenAI client, used directly](#the-openai-client-used-directly)
 - [Claude Agent SDK](#claude-agent-sdk)
 - [A free function imported before init](#a-free-function-imported-before-init)
+- [The Anthropic client, used directly](#the-anthropic-client-used-directly)
 - [Agno](#agno)
 - [LangChain and LangGraph](#langchain-and-langgraph)
 - [CrewAI](#crewai)
-- [The OpenAI client, used directly](#the-openai-client-used-directly)
-- [The Anthropic client, used directly](#the-anthropic-client-used-directly)
 - [Choosing the instrumentors yourself](#choosing-the-instrumentors-yourself)
 - [Every argument at once](#every-argument-at-once)
 - [Where the trace files go](#where-the-trace-files-go)
@@ -78,6 +78,24 @@ defaults to the script's name when you leave it out.
 Importing first is a preference, not a requirement — Argus falls back to asking
 whether the module is importable — but it is the reliable signal, and it costs
 nothing to put your imports at the top.
+
+## The OpenAI client, used directly
+
+No agent framework needed — `pip install "argus-trace[openai]"` traces plain
+client calls:
+
+```python
+import argus
+from openai import OpenAI
+
+argus.init("prompt-lab")
+
+client = OpenAI()
+client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "Two facts about Argus."}],
+)
+```
 
 ## Claude Agent SDK
 
@@ -157,6 +175,29 @@ Only free functions are affected: methods (`Runner.run`, `agent.arun`,
 `ClaudeSDKClient.query`) resolve through their class at call time, so the import
 order never matters for them. [Why the check works this
 way](design-notes.md#stale-bindings-from-an-import-before-init).
+
+## The Anthropic client, used directly
+
+No agent framework needed — `pip install "argus-trace[anthropic]"` traces plain
+client calls:
+
+```python
+import argus
+from anthropic import Anthropic
+
+argus.init("prompt-lab")
+
+client = Anthropic()
+client.messages.create(
+    model="claude-sonnet-4-5",
+    max_tokens=256,
+    messages=[{"role": "user", "content": "Two facts about Argus."}],
+)
+```
+
+Each call is a `messages.create` LLM span with the model name and token counts.
+This is the `anthropic` key, not `claude`: that one is the [Claude Agent
+SDK](#claude-agent-sdk), which doesn't use this package.
 
 ## Agno
 
@@ -342,46 +383,6 @@ not `OTEL_SDK_DISABLED=true`. CrewAI honours both, but the second switches off t
 whole OpenTelemetry SDK, including the tracer provider Argus sets up, and the run
 then records nothing. `init` warns if it finds it set.
 
-## The OpenAI client, used directly
-
-No agent framework needed — `pip install "argus-trace[openai]"` traces plain
-client calls:
-
-```python
-import argus
-from openai import OpenAI
-
-argus.init("prompt-lab")
-
-client = OpenAI()
-client.chat.completions.create(
-    model="gpt-4o-mini",
-    messages=[{"role": "user", "content": "Two facts about Argus."}],
-)
-```
-
-## The Anthropic client, used directly
-
-The same for the Anthropic SDK — `pip install "argus-trace[anthropic]"`:
-
-```python
-import argus
-from anthropic import Anthropic
-
-argus.init("prompt-lab")
-
-client = Anthropic()
-client.messages.create(
-    model="claude-sonnet-4-5",
-    max_tokens=256,
-    messages=[{"role": "user", "content": "Two facts about Argus."}],
-)
-```
-
-Each call is a `messages.create` LLM span with the model name and token counts.
-This is the `anthropic` key, not `claude`: that one is the [Claude Agent
-SDK](#claude-agent-sdk), which doesn't use this package.
-
 ## Choosing the instrumentors yourself
 
 Pass `instrument=` when detection would guess wrong, or when you want the
@@ -523,7 +524,7 @@ argus.init(
 ```
 
 There is no default endpoint and no unauthenticated export: with `otlp` on and
-neither an endpoint nor a key resolvable, `init` raises `ValueError` right at
+either the endpoint or the key unresolvable, `init` raises `ValueError` right at
 that line rather than warning during interpreter shutdown with the run already
 over. A bare `OtlpConfig()` means the same as `otlp=True`.
 
