@@ -1,3 +1,9 @@
+## v0.13.1 (2026-10-12)
+
+### Fix
+
+- init rejects a project that isn't a string.
+
 ## v0.13.0 (2026-10-12)
 
 ### Feat
