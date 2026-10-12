@@ -1,3 +1,9 @@
+## v0.12.0 (2026-10-12)
+
+### Feat
+
+- anthropic key for the Anthropic SDK used directly
+
 ## v0.11.0 (2026-10-09)
 
 ### Feat
