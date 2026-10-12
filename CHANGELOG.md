@@ -1,3 +1,9 @@
+## v0.13.2 (2026-10-12)
+
+### Fix
+
+- docs brought in sync with the code; PLAN.md renamed to ROADMAP.md
+
 ## v0.13.1 (2026-10-12)
 
 ### Fix
