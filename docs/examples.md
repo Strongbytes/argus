@@ -173,10 +173,31 @@ agent = Agent(model=OpenAIChat(id="gpt-4o-mini"))
 agent.run("Summarize the last three papers on retrieval augmentation.")
 ```
 
-Detecting Agno turns on two instrumentors: `AgnoInstrumentor` for the agent's
-own steps and `OpenAIInstrumentor` for the model calls underneath them, since
-Agno's instrumentor doesn't cover those itself. You get the whole stack from the
-one `init`, without naming either.
+Detecting Agno turns on one instrumentor, `AgnoInstrumentor`, and it covers the
+whole stack: the agent's run, its tools, and an LLM span for each model call with
+the provider, model and token counts. That holds for any model class, Claude
+included:
+
+```python
+from agno.models.anthropic import Claude
+
+agent = Agent(model=Claude(id="claude-sonnet-4-5"))
+```
+
+```text
+Agent.run [AGENT]
+  Claude.invoke [LLM] provider=Anthropic
+```
+
+The `openai` and `anthropic` keys are dropped when Agno is detected, because
+their instrumentors would nest a second LLM span with the same tokens under each
+of Agno's, and a backend would count every call twice. If you want the raw
+request parameters OpenAI's span carries, ask for both and accept that double
+count:
+
+```python
+argus.init("research-agent", instrument=["agno", "openai"])
+```
 
 ## LangChain and LangGraph
 
@@ -255,34 +276,65 @@ summary = Task(
 Crew(agents=[researcher], tasks=[summary]).kickoff()
 ```
 
-Two instrumentors turn on: `CrewAIInstrumentor` for the crew, its tasks, agents,
-tools and flows, and `OpenAIInstrumentor` for the model calls, which CrewAI's
-instrumentor doesn't record. The second comes from the `openai` key, detected
-because CrewAI imports `openai` itself. Model and tool calls nest under the task
+`CrewAIInstrumentor` turns on for the crew, its tasks, agents, tools and flows,
+and the provider instrumentors for the model calls, which CrewAI's instrumentor
+doesn't record. `crewai` brings the `openai` and `anthropic` keys along as
+companions, each one if its SDK and its instrumentor are installed, whether or
+not the SDK has been imported yet. Model and tool calls nest under the task
 that made them, including the ones CrewAI runs on a worker thread (native tool
 calls, and an agent with `max_execution_time`). A `Flow` nests its crews under its
 own span.
 
-LLM spans therefore depend on the provider. OpenAI models get them, and so do the
-providers CrewAI reaches through the OpenAI SDK -- OpenRouter, DeepSeek, Ollama,
-vLLM and the like. A crew on Anthropic, Gemini, Bedrock or LiteLLM is still traced
--- crew, tasks, agents, tools -- but without its model calls.
+A crew on Claude works the same way, with the agents built after `init` as
+usual:
 
-If you name the instrumentors yourself, name both, or the model calls go
-untraced:
+```python
+researcher = Agent(
+    role="Researcher",
+    goal="Summarize today's incidents.",
+    backstory="An on-call engineer who reads every alert.",
+    llm="anthropic/claude-sonnet-4-5",
+)
+```
+
+```text
+Crew.kickoff [CHAIN]
+  Researcher._execute_core [AGENT]
+    messages.create [LLM] provider=anthropic
+```
+
+CrewAI imports its Anthropic provider only when that agent is built, which is why
+the companion is found by installation rather than import. It needs `anthropic`
+1.8 or newer, which the Anthropic instrumentor requires. CrewAI's own
+`crewai[anthropic]` extra pins 0.73, so install a current `anthropic` instead:
+
+```bash
+pip install "argus-trace[crewai]" crewai "anthropic>=1.8"
+```
+
+LLM spans therefore depend on the provider. OpenAI and Claude models get them,
+and so do the providers CrewAI reaches through the OpenAI SDK -- OpenRouter,
+DeepSeek, Ollama, vLLM and the like. A crew on Gemini, Bedrock or LiteLLM is still
+traced -- crew, tasks, agents, tools -- but without its model calls.
+
+Companions are added by auto-detection only. If you name the instrumentors
+yourself, name the provider too, or the model calls go untraced:
 
 ```python
 argus.init("research-crew", instrument=["crewai", "openai"])
+argus.init("research-crew", instrument=["crewai", "anthropic"])
 ```
 
-A crew that also uses [LangChain](#langchain-and-langgraph) -- a LangGraph agent
-through CrewAI's adapter, say -- is treated like any other LangChain run: `openai`
-is dropped, so each `ChatOpenAI` call is reported once, and the CrewAI agents'
-own OpenAI calls lose their LLM spans. To keep those, ask for all three and accept
-the duplicate for every `ChatOpenAI` call:
+A crew that also uses [LangChain](#langchain-and-langgraph) -- a tool that runs a
+chain or a graph, say -- is treated like any other LangChain run: `openai` and
+`anthropic` are dropped, so each `ChatOpenAI` or `ChatAnthropic` call is reported
+once, and the CrewAI agents' own model calls lose their LLM spans. To keep those,
+name the crew's provider as well and accept the duplicate for every LangChain call
+on it:
 
 ```python
 argus.init("research-crew", instrument=["crewai", "langchain", "openai"])
+argus.init("research-crew", instrument=["crewai", "langchain", "anthropic"])
 ```
 
 To stop CrewAI's own anonymous telemetry, set `CREWAI_DISABLE_TELEMETRY=true`,

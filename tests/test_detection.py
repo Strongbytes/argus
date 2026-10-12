@@ -233,9 +233,20 @@ class TestCuratedDetectionForReal:
         ``sys.modules`` is the real signal. Every other detector is taken out for
         the duration, because the machine running the suite may genuinely have
         one installed -- and a dev environment has all of them.
-        """
 
-        def _in_use(*keys):
+        Companions are found by importability instead, which the machine would
+        answer just as unpredictably, so that is pinned too: importable are the
+        loaded detectors, the ones named in ``installed`` (an SDK present but
+        not yet imported), and every registry instrumentor, which the fixture
+        above makes resolve.
+        """
+        instrumentor_modules = {
+            path.partition(":")[0]
+            for framework in detection._FRAMEWORKS
+            for path in framework.instrumentors
+        }
+
+        def _in_use(*keys, installed=()):
             for framework in detection._FRAMEWORKS:
                 monkeypatch.delitem(
                     sys.modules, framework.detector, raising=False
@@ -243,6 +254,12 @@ class TestCuratedDetectionForReal:
             for key in keys:
                 detector = detection._BY_KEY[key].detector
                 monkeypatch.setitem(sys.modules, detector, ModuleType(detector))
+            importable = instrumentor_modules | {
+                detection._BY_KEY[key].detector for key in (*keys, *installed)
+            }
+            monkeypatch.setattr(
+                detection, "_module_available", lambda name: name in importable
+            )
 
         return _in_use
 
@@ -254,8 +271,26 @@ class TestCuratedDetectionForReal:
 
         result = detection.resolve_instrumentors(selection)
 
-        # Agno's entry names two: its own instrumentor, plus the OpenAI one for
-        # the client calls underneath it that the first does not cover.
+        assert [type(i).__name__ for i in result] == ["AgnoInstrumentor"]
+
+    @pytest.mark.parametrize("provider", ["openai", "anthropic"])
+    def test_agno_does_not_double_up_with_a_provider(
+        self, provider, frameworks_in_use
+    ):
+        # Agno's instrumentor records every model call itself, whatever the
+        # provider; the provider instrumentor would nest a second LLM span with
+        # the same tokens under each one.
+        frameworks_in_use("agno", provider)
+
+        result = detection.resolve_instrumentors(None)
+
+        assert [type(i).__name__ for i in result] == ["AgnoInstrumentor"]
+
+    def test_explicit_keys_can_still_pair_agno_with_openai(self):
+        # The way back to the raw request parameters the OpenAI span carries,
+        # accepting the double count.
+        result = detection.resolve_instrumentors(["agno", "openai"])
+
         assert [type(i).__name__ for i in result] == [
             "AgnoInstrumentor",
             "OpenAIInstrumentor",
@@ -381,14 +416,45 @@ class TestCuratedDetectionForReal:
             "OpenAIInstrumentor",
         ]
 
+    def test_a_claude_crew_gets_the_anthropic_companion(
+        self, frameworks_in_use
+    ):
+        # What ``init`` sees for a crew on Claude in the usual script order:
+        # CrewAI imports its Anthropic provider only once an agent is built, so
+        # ``anthropic`` is installed but not yet loaded.
+        frameworks_in_use("crewai", "openai", installed=("anthropic",))
+
+        result = detection.resolve_instrumentors(None)
+
+        assert [type(i).__name__ for i in result] == [
+            "CrewAIInstrumentor",
+            "AnthropicInstrumentor",
+            "OpenAIInstrumentor",
+        ]
+
+    def test_the_openai_companion_does_not_rely_on_crewai_importing_it(
+        self, frameworks_in_use
+    ):
+        frameworks_in_use("crewai", installed=("openai",))
+
+        result = detection.resolve_instrumentors(None)
+
+        assert [type(i).__name__ for i in result] == [
+            "CrewAIInstrumentor",
+            "OpenAIInstrumentor",
+        ]
+
     def test_crewai_with_langchain_reports_chatopenai_calls_once(
         self, frameworks_in_use
     ):
-        # Why CrewAI does not pair the OpenAI instrumentor itself: as a key it
-        # stays subject to supersession, so LangChain drops it here exactly as
-        # it does without CrewAI. A pair would bring it back as a class, past
-        # that rule, and report every ``ChatOpenAI`` call twice.
-        frameworks_in_use("crewai", "langchain", "openai")
+        # Why CrewAI's providers are companions rather than a pair: as keys
+        # they stay subject to supersession, so LangChain drops both here
+        # exactly as it does without CrewAI. A pair would bring them back as
+        # classes, past that rule, and report every ``ChatOpenAI`` and
+        # ``ChatAnthropic`` call twice.
+        frameworks_in_use(
+            "crewai", "langchain", "openai", installed=("anthropic",)
+        )
 
         result = detection.resolve_instrumentors(None)
 
@@ -398,23 +464,33 @@ class TestCuratedDetectionForReal:
         ]
 
     def test_explicit_crewai_alone_has_no_llm_instrumentor(self):
-        # The documented cost of leaving the pairing to the ``openai`` key: an
-        # explicit selection names it too, as ``["crewai", "openai"]``.
+        # Explicit means exact, so companions don't expand it: an explicit
+        # selection names the provider too, as ``["crewai", "openai"]``.
         result = detection.resolve_instrumentors("crewai")
 
         assert [type(i).__name__ for i in result] == ["CrewAIInstrumentor"]
 
-    def test_explicit_keys_can_pair_crewai_and_langchain_with_openai(self):
-        # The escape hatch for a mixed run whose CrewAI agents call OpenAI
-        # natively, accepting the duplicate for each ``ChatOpenAI`` call.
+    @pytest.mark.parametrize(
+        ("provider", "instrumentor"),
+        [
+            ("openai", "OpenAIInstrumentor"),
+            ("anthropic", "AnthropicInstrumentor"),
+        ],
+    )
+    def test_explicit_keys_can_pair_crewai_and_langchain_with_a_provider(
+        self, provider, instrumentor
+    ):
+        # The escape hatch for a mixed run whose CrewAI agents call the
+        # provider natively, accepting the duplicate for each LangChain model
+        # call on it.
         result = detection.resolve_instrumentors(
-            ["crewai", "langchain", "openai"]
+            ["crewai", "langchain", provider]
         )
 
         assert [type(i).__name__ for i in result] == [
             "CrewAIInstrumentor",
             "LangChainInstrumentor",
-            "OpenAIInstrumentor",
+            instrumentor,
         ]
 
     def test_every_framework_on_its_own_turns_something_on(
@@ -475,10 +551,30 @@ class TestSupersession:
 
     def test_a_framework_supersedes_nothing_by_default(self):
         # The common case stays a three-field entry.
-        assert (
-            detection._Framework("openai", "openai", ("mod:Cls",)).supersedes
-            == ()
-        )
+        framework = detection._Framework("openai", "openai", ("mod:Cls",))
+
+        assert framework.supersedes == ()
+        assert framework.companions == ()
+
+    def test_every_companion_exists(self):
+        for framework in detection._FRAMEWORKS:
+            assert set(framework.companions) <= set(detection._BY_KEY)
+
+    def test_no_framework_both_supersedes_and_companions_a_key(self):
+        # It would add the key and drop it again in one detection pass.
+        for framework in detection._FRAMEWORKS:
+            assert set(framework.companions).isdisjoint(framework.supersedes)
+
+    def test_companions_are_one_level_deep(self):
+        # ``_auto_keys`` adds the companions of detected frameworks only, not
+        # of the companions it added, so a companion's own would be ignored.
+        for framework in detection._FRAMEWORKS:
+            for key in framework.companions:
+                assert detection._BY_KEY[key].companions == ()
+
+    def test_no_framework_is_its_own_companion(self):
+        for framework in detection._FRAMEWORKS:
+            assert framework.key not in framework.companions
 
 
 class TestClassesForKeys:
@@ -496,9 +592,17 @@ class TestClassesForKeys:
     def test_resolves_each_path_for_a_known_key(self, monkeypatch):
         monkeypatch.setattr(detection, "_load", lambda path: path)
 
-        assert detection._classes_for_keys(["agno"]) == [
+        assert detection._classes_for_keys(["agno", "openai"]) == [
             "openinference.instrumentation.agno:AgnoInstrumentor",
             "openinference.instrumentation.openai:OpenAIInstrumentor",
+        ]
+
+    def test_agno_resolves_to_its_instrumentor_alone(self, monkeypatch):
+        # Its instrumentor records the model calls itself, so it pairs nothing.
+        monkeypatch.setattr(detection, "_load", lambda path: path)
+
+        assert detection._classes_for_keys(["agno"]) == [
+            "openinference.instrumentation.agno:AgnoInstrumentor"
         ]
 
     @pytest.mark.parametrize("key", ["langchain", "langgraph"])
@@ -583,15 +687,16 @@ class TestAutoKeys:
 
         assert detection._auto_keys() == ["openai_agents"]
 
-    def test_agno_also_supersedes_standalone_openai(self, monkeypatch):
+    @pytest.mark.parametrize("provider", ["openai", "anthropic"])
+    def test_agno_supersedes_the_provider_keys(self, provider, monkeypatch):
         monkeypatch.setattr(
             detection,
             "_module_loaded",
-            lambda name: name in {"agno", "openai"},
+            lambda name: name in {"agno", provider},
         )
 
-        # agno already pairs in the OpenAI instrumentor, so dropping the
-        # standalone "openai" key changes the detected keys, not the classes.
+        # Load-bearing: Agno's instrumentor records the model calls itself, so
+        # a provider key alongside it would count each one twice.
         assert detection._auto_keys() == ["agno"]
 
     def test_langgraph_app_is_detected_without_the_langchain_package(
@@ -628,16 +733,112 @@ class TestAutoKeys:
 
         assert detection._auto_keys() == ["anthropic"]
 
+    @staticmethod
+    def _importable(monkeypatch, *names):
+        """Make exactly ``names`` importable, plus every registry instrumentor.
+
+        Companions are checked by importability, which the machine running the
+        suite would otherwise answer.
+        """
+        importable = set(names) | {
+            path.partition(":")[0]
+            for framework in detection._FRAMEWORKS
+            for path in framework.instrumentors
+        }
+        monkeypatch.setattr(
+            detection, "_module_available", lambda name: name in importable
+        )
+
     def test_crewai_keeps_the_openai_key(self, monkeypatch):
         monkeypatch.setattr(
             detection,
             "_module_loaded",
             lambda name: name in {"crewai", "openai"},
         )
+        self._importable(monkeypatch, "crewai", "openai")
 
-        # Unlike agno, crewai supersedes nothing: the standalone key is where
+        # Unlike agno, crewai supersedes nothing: the provider keys are where
         # its LLM spans come from.
         assert detection._auto_keys() == ["crewai", "openai"]
+
+    def test_crewai_companions_are_found_by_importability(self, monkeypatch):
+        # Only ``crewai`` is loaded: CrewAI imports its Anthropic provider once
+        # an agent is built, after ``init``. Returned in registry order, not
+        # in the order they were found.
+        monkeypatch.setattr(
+            detection, "_module_loaded", lambda name: name == "crewai"
+        )
+        self._importable(monkeypatch, "crewai", "openai", "anthropic")
+
+        assert detection._auto_keys() == ["crewai", "anthropic", "openai"]
+
+    def test_a_companion_whose_sdk_is_not_installed_is_skipped(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            detection, "_module_loaded", lambda name: name == "crewai"
+        )
+        self._importable(monkeypatch, "crewai", "openai")
+
+        assert detection._auto_keys() == ["crewai", "openai"]
+
+    def test_a_companion_whose_instrumentor_is_missing_is_skipped(
+        self, monkeypatch
+    ):
+        # ``anthropic`` pulled in by something else, without the instrumentor:
+        # turning the key on would make ``_load`` raise out of ``init`` for a
+        # key nobody asked for.
+        monkeypatch.setattr(
+            detection, "_module_loaded", lambda name: name == "crewai"
+        )
+        monkeypatch.setattr(
+            detection,
+            "_module_available",
+            lambda name: name
+            in {
+                "crewai",
+                "openai",
+                "anthropic",
+                "openinference.instrumentation.openai",
+            },
+        )
+
+        assert detection._auto_keys() == ["crewai", "openai"]
+
+    def test_companions_need_their_framework_detected(self, monkeypatch):
+        # ``crewai`` installed but not imported, with something else loaded:
+        # its companions don't come along.
+        monkeypatch.setattr(
+            detection, "_module_loaded", lambda name: name == "agents"
+        )
+        self._importable(monkeypatch, "agents", "crewai", "anthropic")
+
+        assert detection._auto_keys() == ["openai_agents"]
+
+    def test_langchain_drops_both_companions_from_a_crew(self, monkeypatch):
+        # Companions go through supersession like any other key.
+        monkeypatch.setattr(
+            detection,
+            "_module_loaded",
+            lambda name: name in {"crewai", "langchain_core"},
+        )
+        self._importable(
+            monkeypatch, "crewai", "langchain_core", "openai", "anthropic"
+        )
+
+        assert detection._auto_keys() == ["langchain", "crewai"]
+
+    def test_agno_drops_both_companions_from_a_crew(self, monkeypatch):
+        # Supersession is process-wide, as the patching is: a self-recording
+        # framework in the run costs the crew its LLM spans.
+        monkeypatch.setattr(
+            detection,
+            "_module_loaded",
+            lambda name: name in {"agno", "crewai"},
+        )
+        self._importable(monkeypatch, "agno", "crewai", "openai", "anthropic")
+
+        assert detection._auto_keys() == ["agno", "crewai"]
 
     def test_crewai_keeps_the_openai_key_when_nothing_is_imported(
         self, monkeypatch
@@ -659,6 +860,7 @@ class TestAutoKeys:
             "_module_loaded",
             lambda name: name in {"crewai", "langchain_core", "openai"},
         )
+        self._importable(monkeypatch, "crewai", "langchain_core", "openai")
 
         assert detection._auto_keys() == ["langchain", "crewai"]
 
@@ -709,6 +911,24 @@ class TestModuleProbes:
 
     def test_available_is_false_for_a_module_that_is_not_there(self):
         assert not detection._module_available("argus_no_such_framework")
+
+    def test_a_companion_needs_its_sdk_and_its_instrumentor(
+        self, installed_but_unimported
+    ):
+        def companion(detector, path):
+            return detection._Framework("openai", detector, (path,))
+
+        assert detection._companion_available(
+            companion(installed_but_unimported, "tests.factories:Cls")
+        )
+        assert not detection._companion_available(
+            companion(installed_but_unimported, "argus_no_such.pkg:Cls")
+        )
+        assert not detection._companion_available(
+            companion("argus_no_such_framework", "tests.factories:Cls")
+        )
+        # Asked without importing the SDK, as detection's other probes are.
+        assert installed_but_unimported not in sys.modules
 
     def test_available_is_false_when_the_probe_itself_fails(self):
         # A name whose parent package is missing makes the spec lookup raise

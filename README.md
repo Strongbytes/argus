@@ -442,7 +442,7 @@ use (preferring already-imported modules) and avoiding double-instrumentation:
 | --------------- | ------------------ | ------------------------------------------- |
 | `openai_agents` | `agents`           | `OpenAIAgentsInstrumentor`                  |
 | `claude`        | `claude_agent_sdk` | `ClaudeAgentSDKInstrumentor`                |
-| `agno`          | `agno`             | `AgnoInstrumentor` + `OpenAIInstrumentor`   |
+| `agno`          | `agno`             | `AgnoInstrumentor`                          |
 | `langchain`     | `langchain_core`   | `LangChainInstrumentor`                     |
 | `langgraph`     | `langgraph`        | `LangChainInstrumentor`                     |
 | `crewai`        | `crewai`           | `CrewAIInstrumentor`                        |
@@ -453,6 +453,23 @@ use (preferring already-imported modules) and avoiding double-instrumentation:
 Agent SDK runs its model calls in a Claude Code subprocess rather than through
 the `anthropic` package, so the two never overlap, and a script using both gets
 both.
+
+The provider keys, `openai` and `anthropic`, follow one rule: provider spans are
+on unless a detected framework already records the model calls. `openai_agents`,
+`agno`, `langchain` and `langgraph` record them, so detecting one drops the
+provider keys; `crewai` doesn't, so detecting it turns them on (see below). An
+explicit list is exactly what you name, never trimmed or expanded. Patching is
+process-wide, so in a run that mixes frameworks the rule applies to the whole
+process.
+
+Agno's instrumentor records every model call itself -- an LLM span with the
+provider, model and token counts, for `OpenAIChat`, `Claude` and any other model
+class -- so `agno` turns on `AgnoInstrumentor` alone. A provider instrumentor
+alongside it would nest a second LLM span with the same tokens under each one,
+and a backend summing usage would count every call twice.
+`instrument=["agno", "openai"]` brings back the raw request parameters that
+OpenAI's span carries, accepting that double count. A raw `openai` or
+`anthropic` client call inside an Agno script is not traced in auto mode.
 
 `langchain` and `langgraph` are two names for one instrumentor. OpenInference has
 no separate LangGraph instrumentor: `LangChainInstrumentor` hooks the
@@ -474,19 +491,33 @@ explicit list is never trimmed -- and accepts that duplication for every LangCha
 model call on that provider.
 
 CrewAI's instrumentor records crews, tasks, agents, tools and flows, but no model
-calls. Those come from the `openai` key, which auto-detection picks alongside
-`crewai` because CrewAI imports `openai` itself, and they nest under the task
-that made the call. That covers crews on OpenAI and on the OpenAI-compatible
-providers CrewAI builds on the OpenAI SDK (OpenRouter, DeepSeek, Ollama and the
-like). A crew on Anthropic, Gemini, Bedrock or LiteLLM is traced without its LLM
-spans. Unlike `agno`, `crewai` doesn't pair the OpenAI instrumentor itself, so:
+calls. Those come from the provider keys, which `crewai` turns on as
+**companions**: when CrewAI is detected, auto-detection adds `openai` and
+`anthropic` if their SDK and their instrumentor are both installed. They are
+checked by installation rather than import, because CrewAI imports its
+Anthropic provider only when an agent on a Claude model is built, usually after
+`init`. The model calls nest under the task that made them. That covers crews on
+OpenAI, on Claude, and on the OpenAI-compatible providers CrewAI builds on the
+OpenAI SDK (OpenRouter, DeepSeek, Ollama and the like). A crew on Gemini, Bedrock
+or LiteLLM is traced without its LLM spans.
 
-- An explicit `instrument="crewai"` has no LLM spans; ask for
-  `["crewai", "openai"]`.
-- A crew that also uses LangChain has `openai` dropped like any other LangChain
-  run, so `ChatOpenAI` calls are reported once, but the CrewAI agents' own
-  OpenAI calls go untraced. `instrument=["crewai", "langchain", "openai"]` traces
-  both and reports every `ChatOpenAI` call twice.
+A Claude crew needs `anthropic` 1.8 or newer, the oldest release the current
+Anthropic instrumentor (3.x) supports. CrewAI's own `crewai[anthropic]` extra pins
+`anthropic~=0.73.0`, so install CrewAI without that extra and add a current
+`anthropic` yourself (`pip install "argus-trace[crewai]" crewai "anthropic>=1.8"`).
+On 0.73 the instrumentor logs that the version is out of range and records
+nothing.
+
+Companions are still keys, so:
+
+- An explicit `instrument="crewai"` is not expanded and has no LLM spans; ask
+  for `["crewai", "openai"]` or `["crewai", "anthropic"]`.
+- A crew that also uses LangChain has both companions dropped like any other
+  LangChain run, so `ChatOpenAI` and `ChatAnthropic` calls are reported once, but
+  the CrewAI agents' own model calls go untraced.
+  `instrument=["crewai", "langchain", "openai"]` (or `"anthropic"` for a Claude
+  crew) traces both and reports every LangChain call on that provider twice.
+- The same goes for a crew next to Agno or the OpenAI Agents SDK in one process.
 
 Don't turn CrewAI's own telemetry off with `OTEL_SDK_DISABLED=true`: that
 switches off the OpenTelemetry SDK Argus runs on too, and the run records nothing

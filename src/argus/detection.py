@@ -107,7 +107,14 @@ class _Framework:
     is in play; ``instrumentors`` are ``"module:ClassName"`` paths to apply;
     ``supersedes`` names the keys auto-detection drops when this framework is
     detected, which is what stops a narrower key from doubling up coverage this
-    one already provides; and ``free_functions`` names the module-level
+    one already provides; ``companions`` names the provider keys auto-detection
+    adds when this framework is detected, for a framework whose instrumentor
+    records structure only and leaves the model calls to the providers'. A
+    companion is found by importability rather than ``sys.modules``, because a
+    framework may import its provider SDK only once an agent is built, after
+    ``init`` has run; it is added only if its instrumentor is importable too,
+    and it is still subject to supersession. Neither field ever changes an
+    explicit list. And ``free_functions`` names the module-level
     functions of ``detector`` that its instrumentor patches by rebinding, which
     :mod:`argus.bindings` watches because a ``from``-import of one of those
     before ``init`` freezes the un-instrumented original. Everything about a
@@ -119,6 +126,7 @@ class _Framework:
     detector: str
     instrumentors: tuple[str, ...]
     supersedes: tuple[InstrumentKey, ...] = ()
+    companions: tuple[InstrumentKey, ...] = ()
     free_functions: tuple[str, ...] = ()
 
 
@@ -126,6 +134,12 @@ class _Framework:
 # instrumentors are applied. It is not what keeps OpenAI calls from being
 # instrumented twice -- each entry's ``supersedes`` does that, and reordering
 # these entries would not change it.
+#
+# No entry pairs an instrumentor it doesn't own. A framework whose instrumentor
+# records the model calls itself ``supersedes`` the provider keys; one that
+# records structure only names them as ``companions``; one with no Python
+# provider SDK under it does neither. So provider spans are on unless a detected
+# framework already records the model calls.
 _FRAMEWORKS: tuple[_Framework, ...] = (
     _Framework(
         "openai_agents",
@@ -155,16 +169,15 @@ _FRAMEWORKS: tuple[_Framework, ...] = (
     _Framework(
         "agno",
         "agno",
-        (
-            "openinference.instrumentation.agno:AgnoInstrumentor",
-            "openinference.instrumentation.openai:OpenAIInstrumentor",
-        ),
-        # Cosmetic, unlike the entry above: Agno's instrumentor does not cover
-        # OpenAI calls, which is why the pair here includes OpenAIInstrumentor
-        # already -- so dropping the standalone key changes the detected keys
-        # and not the classes resolved from them. Kept so the selection does not
-        # read as the double instrumentation that dedupe quietly prevents.
-        supersedes=("openai",),
+        ("openinference.instrumentation.agno:AgnoInstrumentor",),
+        # Load-bearing, as for ``openai_agents``: Agno's instrumentor wraps
+        # every model class under ``agno.models`` (``invoke``, ``ainvoke`` and
+        # the streaming variants) and emits an LLM span with provider, model
+        # and token counts whatever the provider. A provider instrumentor on as well
+        # nests a second LLM span with the same tokens under each one, which a
+        # backend summing usage counts twice -- for ``OpenAIChat`` and
+        # ``Claude`` alike.
+        supersedes=("openai", "anthropic"),
     ),
     # LangChain and LangGraph are two names for one instrumentor. OpenInference
     # ships no LangGraph instrumentor: ``LangChainInstrumentor`` hooks
@@ -184,7 +197,7 @@ _FRAMEWORKS: tuple[_Framework, ...] = (
     # place as a key -- an explicit ``instrument="langgraph"`` consults no
     # detector at all.
     #
-    # Load-bearing, unlike Agno's: ``langchain-openai`` and
+    # Load-bearing, as for Agno: ``langchain-openai`` and
     # ``langchain-anthropic`` call the provider SDKs underneath, and the
     # standalone OpenAI or Anthropic instrumentor would report the same call a
     # second time -- same token counts, so a backend would count them twice.
@@ -215,24 +228,31 @@ _FRAMEWORKS: tuple[_Framework, ...] = (
     # wrapper mode for a Python app. ``init`` passes ``tracer_provider`` and
     # nothing else, so wrapper mode is what runs.
     #
-    # The LLM spans come from the standalone ``openai`` key, deliberately not
-    # paired in here the way Agno pairs it, and so not superseded either.
-    # ``import crewai`` imports ``openai`` (a hard dependency, which its native
-    # OpenAI provider and the OpenAI-compatible ones built on it call), so
-    # detection finds both keys anyway. Leaving it a key keeps it subject to
-    # supersession: a run that also uses LangChain drops it as ``langchain``
-    # requires, rather than having a pair smuggle the OpenAI instrumentor past
-    # that rule and report every ``ChatOpenAI`` call twice. The cost is that an
-    # explicit ``instrument="crewai"`` gets no LLM spans -- ``["crewai",
-    # "openai"]`` does.
+    # The LLM spans come from the provider keys, turned on as companions. They
+    # stay keys rather than being paired in as classes, so they remain subject
+    # to supersession: a run that also uses LangChain drops them as
+    # ``langchain`` requires, rather than having a pair smuggle a provider
+    # instrumentor past that rule and report every ``ChatOpenAI`` call twice.
     #
-    # A crew on Anthropic, Gemini, Bedrock or LiteLLM gets the structure spans
-    # and no LLM spans; covering those would mean turning an instrumentor on
-    # only when its provider is in use, which an entry cannot express.
+    # Companions, rather than ordinary detection, because of when CrewAI loads
+    # its providers. ``import crewai`` imports ``openai`` (a hard dependency),
+    # so ``openai`` is detected anyway and listing it is redundant today -- but
+    # it says what the entry means, and stops depending on CrewAI's import
+    # graph. The native Anthropic provider (``anthropic/...`` and ``claude-...``
+    # models) is imported lazily, in ``LLM._get_native_provider``, when an agent
+    # on a Claude model is built. In the usual script order that is after
+    # ``init``, so ``anthropic`` is not in ``sys.modules`` when detection runs,
+    # and with ``crewai`` loaded the importability fallback never runs either.
+    #
+    # An explicit ``instrument="crewai"`` is not expanded, and so gets no LLM
+    # spans -- ``["crewai", "openai"]`` or ``["crewai", "anthropic"]`` does. A
+    # crew on Gemini, Bedrock or LiteLLM gets the structure spans and no LLM
+    # spans, since Argus has no key for those providers.
     _Framework(
         "crewai",
         "crewai",
         ("openinference.instrumentation.crewai:CrewAIInstrumentor",),
+        companions=("openai", "anthropic"),
     ),
     # The Anthropic API SDK, used directly -- not ``claude``, which is the Claude
     # Agent SDK. That one doesn't depend on ``anthropic``: it drives the Claude
@@ -277,8 +297,10 @@ def _module_loaded(name: str) -> bool:
 def _module_available(name: str) -> bool:
     """Return whether ``name`` is importable, without importing it.
 
-    Used as the fallback signal when nothing relevant is loaded yet. The broad
-    ``except`` covers oddly-packaged modules whose spec lookup itself raises.
+    Used as the fallback signal when nothing relevant is loaded yet, and for a
+    detected framework's companions. A dotted name imports its parent packages
+    to be looked up, but never the module itself. The broad ``except`` covers
+    oddly-packaged modules whose spec lookup itself raises.
     """
     try:
         return find_spec(name) is not None
@@ -286,24 +308,50 @@ def _module_available(name: str) -> bool:
         return False
 
 
+def _companion_available(framework: _Framework) -> bool:
+    """Return whether a companion key can be turned on in this environment.
+
+    Its provider SDK can be installed without its instrumentor (pulled in by
+    something else), and ``_load`` would then raise out of ``init`` for a key
+    nobody asked for. So both have to be importable; a companion that fails
+    either check is skipped.
+    """
+    return _module_available(framework.detector) and all(
+        _module_available(path.partition(":")[0])
+        for path in framework.instrumentors
+    )
+
+
 def _auto_keys() -> list[InstrumentKey]:
     """Detect frameworks in use, preferring what's already imported.
 
-    Falls back to importability when nothing relevant is loaded yet, then drops
-    every key a detected framework supersedes (see :class:`_Framework`), so a
-    framework's own coverage is never doubled up by a narrower key. See
-    ``docs/design-notes.md`` ("Curated detection over entry points").
+    Falls back to importability when nothing relevant is loaded yet, then adds
+    each detected framework's companions, then drops every key a detected
+    framework supersedes (see :class:`_Framework`), so a framework's own
+    coverage is never doubled up by a narrower key. Returned in registry order.
+    See ``docs/design-notes.md`` ("Curated detection over entry points").
     """
-    candidates = [fw.key for fw in _FRAMEWORKS if _module_loaded(fw.detector)]
+    candidates = {fw.key for fw in _FRAMEWORKS if _module_loaded(fw.detector)}
     if not candidates:
-        candidates = [
+        candidates = {
             fw.key for fw in _FRAMEWORKS if _module_available(fw.detector)
-        ]
-    detected = set(candidates)
+        }
+    companions = {
+        key
+        for fw in _FRAMEWORKS
+        if fw.key in candidates
+        for key in fw.companions
+        if key not in candidates and _companion_available(_BY_KEY[key])
+    }
+    detected = candidates | companions
     superseded = {
         key for fw in _FRAMEWORKS if fw.key in detected for key in fw.supersedes
     }
-    return [key for key in candidates if key not in superseded]
+    return [
+        fw.key
+        for fw in _FRAMEWORKS
+        if fw.key in detected and fw.key not in superseded
+    ]
 
 
 def _entry_point_classes() -> list[type[Instrumentor]]:

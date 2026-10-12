@@ -6,8 +6,8 @@ documentation: when the work lands, the rationale moves to the design notes and
 this file can be deleted.
 
 1. [A simple `anthropic` key](#1-a-simple-anthropic-key) - DONE
-2. [Agno + Anthropic (and the Agno double count)](#2-agno--anthropic-and-the-agno-double-count)
-3. [CrewAI + Anthropic](#3-crewai--anthropic)
+2. [Agno + Anthropic (and the Agno double count)](#2-agno--anthropic-and-the-agno-double-count) - DONE
+3. [CrewAI + Anthropic](#3-crewai--anthropic) - DONE
 4. [CrewAI + LangChain / LangGraph](#4-crewai--langchain--langgraph)
 5. [`init` rejects a project that isn't a string](#5-init-rejects-a-project-that-isnt-a-string)
 6. [Nesting work started inside LangChain / LangGraph (optional)](#6-nesting-work-started-inside-langchain--langgraph-optional)

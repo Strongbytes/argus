@@ -688,6 +688,51 @@ one self-contained entry rather than an entry plus an edit to a table elsewhere
 in the module. It also generalizes past the one case that motivated it: any
 framework can declare the narrower keys its own coverage makes redundant.
 
+### Provider keys: supersedes, companions, or neither
+
+No registry entry pairs an instrumentor it doesn't own. A framework entry lists
+only its own instrumentor, and relates to the provider keys (`openai`,
+`anthropic`) in one of three ways:
+
+| Framework's instrumentor...         | Entry declares                  | Keys                                              |
+| ----------------------------------- | ------------------------------- | ------------------------------------------------- |
+| records the model calls itself      | `supersedes` the provider keys  | `openai_agents`, `agno`, `langchain`, `langgraph` |
+| records structure only              | `companions`: the provider keys | `crewai`                                          |
+| has no Python provider SDK under it | neither                         | `claude`                                          |
+
+In one sentence: *provider spans are on unless a detected framework already
+records the model calls.* Explicit lists stay exact, never trimmed by
+supersession and never expanded by companions.
+
+Companions are applied before supersession, and go through it like any other
+key: `_auto_keys` finds its candidates, adds each detected framework's companions,
+then drops whatever a detected framework supersedes, and returns the result in
+registry order. Patching is process-wide, so supersession is too. In a mixed run,
+a structure-only framework (CrewAI) loses its LLM spans whenever a self-recording
+one is detected, and a raw client call goes untraced next to any self-recording
+framework. That is inherent rather than an inconsistency, and naming the keys
+explicitly is the escape hatch.
+
+A pair, a framework entry listing a provider's instrumentor class directly, is
+what this rule replaced. Supersession drops keys, not classes, so a pair would
+smuggle the provider instrumentor past every other framework's `supersedes`.
+Agno's entry used to pair `OpenAIInstrumentor`, on the belief that Agno's
+instrumentor didn't cover OpenAI calls. It does: `AgnoInstrumentor` walks every
+module under `agno.models` and wraps each model class's `invoke`, `ainvoke` and
+streaming variants, emitting an LLM span with provider, model and token counts
+for every provider. With the pair, each `OpenAIChat` call had a nested
+`ChatCompletion` span with the same tokens under it, and a backend summing usage
+over LLM spans counted it twice. An Agno agent on `Claude` already got exactly
+one LLM span, and turning the Anthropic instrumentor on as well nested the same
+duplicate. So `agno` now turns on `AgnoInstrumentor` alone and supersedes both
+provider keys. The nested span carried the raw request parameters, which
+`instrument=["agno", "openai"]` brings back with the double count. Agno imports
+neither provider SDK on `import agno`, and the model wrapping goes back to
+`openinference-instrumentation-agno` 0.1.5, so no version floor was needed.
+Checked with Agno 3.1 against stub servers: one `OpenAIChat.invoke` and one
+`Claude.invoke` LLM span per call, and the nested `ChatCompletion` back only
+under the explicit pair.
+
 Detection prefers `sys.modules` over importability, so in a shared environment
 with several SDKs installed Argus instruments only the framework the current
 script actually imported, rather than everything present. Instrumentor classes
@@ -722,8 +767,7 @@ instrumented. The price is breadth: anything that imports `langchain_core`,
 including a library pulling it in as a dependency, now selects the instrumentor.
 Detection prefers `sys.modules`, so only a real import does.
 
-Both entries supersede `openai` and `anthropic`, and unlike Agno's this is not
-cosmetic. `langchain-openai` calls the OpenAI SDK and `langchain-anthropic` the
+Both entries supersede `openai` and `anthropic`. `langchain-openai` calls the OpenAI SDK and `langchain-anthropic` the
 Anthropic one, so with a provider instrumentor also on, every model call is
 reported twice -- once as LangChain's LLM span, once as the provider's, each with
 the same token counts, so a backend summing usage counts it twice. The second does
@@ -759,7 +803,7 @@ free functions. Checked with `anthropic` 1.13 and the instrumentor 3.0 against a
 stub server: a raw client call is one `messages.create` LLM span with token
 counts, and `ChatAnthropic` under auto-detection is one `ChatAnthropic` span.
 
-### CrewAI: wrapper mode, OpenAI through its own key
+### CrewAI: wrapper mode, providers as companions
 
 `CrewAIInstrumentor` has two modes. The default wraps CrewAI's methods --
 `Crew.kickoff`, `Task._execute_core`, `Agent.kickoff`, `Flow`'s entry points, the
@@ -770,41 +814,60 @@ instrumentor's README recommends it for a Python app and keeps the listener for
 CrewAI AMP, and `init` hands every instrumentor `tracer_provider` and nothing
 else, so there is no channel for per-instrumentor options to begin with.
 
-The LLM spans come from `OpenAIInstrumentor`. CrewAI depends on `openai`, its
-native OpenAI provider calls the SDK, and so do the OpenAI-compatible providers
-built on it (OpenRouter, DeepSeek, Ollama, vLLM). A crew on Anthropic, Gemini,
-Bedrock or LiteLLM gets its structure spans and no LLM spans. The `anthropic` key
-doesn't rescue a Claude crew: CrewAI imports its Anthropic provider lazily, when
-an agent with a Claude model is built, which in the usual script order is after
-`init` has already looked at `sys.modules`. Covering that means a framework
-turning on its provider keys by importability, which an entry cannot express
-today. That is deferred rather than worked around, and the README states the
-limit.
+The LLM spans come from the provider instrumentors, which `crewai` names as
+`companions=("openai", "anthropic")`. CrewAI's native OpenAI provider calls the
+OpenAI SDK, and so do the OpenAI-compatible providers built on it (OpenRouter,
+DeepSeek, Ollama, vLLM); its native Anthropic provider (`anthropic/...` and
+`claude-...` models) calls the Anthropic SDK. A crew on Gemini, Bedrock or LiteLLM
+gets its structure spans and no LLM spans, since Argus has no key for those.
 
-Unlike Agno's entry, `crewai`'s doesn't list `OpenAIInstrumentor`. It doesn't
-need to: `import crewai` imports `openai`, and `openai` is a hard dependency, so
-auto-detection finds the `openai` key whether it reads `sys.modules` or falls
-back to importability. A CrewAI-only run ends up with the same two instrumentors
-either way. The difference shows when LangChain is in the run too, which CrewAI's
-LangGraph agent adapter makes a real combination. Supersession drops keys, not
-classes. A pair names its classes directly, so it would bring `OpenAIInstrumentor`
-back past `langchain`'s `supersedes=("openai",)`, and every `ChatOpenAI` call
-would be reported twice. As a key, `openai` is dropped there as in any other
-LangChain run. The CrewAI agents' own OpenAI calls then go untraced, the same
-trade LangChain already makes for a node calling the raw client, with the same
-escape hatch: `instrument=["crewai", "langchain", "openai"]`. Losing those spans
-is the lesser failure, since a duplicate double-counts tokens and splits the
-trace, while a gap only leaves something out. With a pair, nobody could choose
-otherwise.
+Companions exist because of when CrewAI loads its providers. `import crewai`
+imports `openai`, a hard dependency, so `openai` would be detected anyway. But
+the Anthropic provider is imported lazily, in `LLM._get_native_provider`, when an
+agent with a Claude model is built. In the usual script order (imports, then
+`init`, then agents) `anthropic` is not in `sys.modules` when `init` runs, and
+since `crewai` is loaded the importability fallback doesn't run either, so a plain
+`anthropic` key would never be detected for a Claude crew. A companion is
+therefore checked by importability (`find_spec`), not `sys.modules`. Listing
+`openai` too is redundant today, but it says what the entry means and stops
+depending on CrewAI's import graph.
 
-The cost is that an explicit `instrument="crewai"` turns on no LLM instrumentor,
-because nothing is auto-detected for an explicit list. The README says to write
-`["crewai", "openai"]`. Making supersession drop classes as well would have kept
-the pairing, but it is a structural change to the registry. It would also force
-the same trade with no way out, and silently change Agno's behaviour. Agno still
-pairs, and so still has the gap alongside LangChain; moving it to the same shape
-would change what the released `instrument="agno"` turns on, so that is left as a
-separate decision.
+The guard checks two things: the provider SDK *and* its instrumentor module must
+be importable. The SDK can be installed without the instrumentor, pulled in by
+something else, and `_load` would then raise out of `init` for a key nobody asked
+for; such a companion is skipped. The `crewai` extra installs both instrumentors,
+so the guard is a safety net rather than the normal path. The cost runs the other
+way: with `anthropic` installed but the crew on OpenAI, the Anthropic instrumentor
+patches a client that is never called, which is harmless.
+
+The guard doesn't check versions, and that matters for Anthropic. Every
+`openinference-instrumentation-anthropic` from 1.0 on requires `anthropic>=0.84`
+(3.x requires 1.8), and declares it only under its `instruments` extra, so pip
+installs any version beside any SDK. CrewAI's `crewai[anthropic]` extra pins
+`anthropic~=0.73.0`. On that pin the companion is selected and OpenTelemetry's
+dependency check makes the instrumentor log that the version is out of range and
+patch nothing; the last instrumentor that accepted 0.73 (0.1.20) no longer
+imports against current `wrapt`. CrewAI 1.15 runs fine on `anthropic` 1.13, which
+is what the README tells a Claude crew to install. Skipping the companion on a
+version mismatch was rejected: it would turn the logged explanation into silence.
+
+Companions are keys, not classes, which is the point. Supersession drops keys,
+so when LangChain is in the run too, `langchain`'s `supersedes` drops both
+companions exactly as it drops the provider keys in any other LangChain run, and
+each `ChatOpenAI` or `ChatAnthropic` call is reported once. The CrewAI agents' own
+model calls then go untraced, the same trade LangChain already makes for a node
+calling the raw client, with the same escape hatch:
+`instrument=["crewai", "langchain", "openai"]`, or `"anthropic"` for a Claude
+crew. Losing those spans is the lesser failure, since a duplicate double-counts
+tokens and splits the trace, while a gap only leaves something out. With a pair,
+nobody could choose otherwise.
+
+Explicit lists are not expanded, which keeps "explicit means exact". The cost is
+that an explicit `instrument="crewai"` turns on no LLM instrumentor, and the
+README says to write `["crewai", "openai"]` or `["crewai", "anthropic"]`.
+Expanding companions for explicit keys would remove that footgun, at the price of
+explicit no longer meaning exact; that is left open. `instrument="all"` is
+unaffected, since it reads entry points and never consults the registry.
 
 Unlike LangChain's, CrewAI's wrappers start their spans as current, so the OpenAI
 span nests under the task that made the call, and a span of your own
@@ -818,6 +881,11 @@ recorded under a `blindspot`, and a clean re-instrument after `reset`. A crew
 plus a `ChatOpenAI` call in one run reported the `ChatOpenAI` call once and the
 crew without LLM spans; with all three keys named, the crew's model calls were
 back and the `ChatOpenAI` call appeared twice, the second as a trace of its own.
+The Claude side was checked with CrewAI 1.15, `anthropic` 1.13 and the
+instrumentor 3.0 against a stub Anthropic server: a crew whose agent was built
+after a bare `init` got a `messages.create` LLM span with tokens under its agent
+span. A run that also made a `ChatAnthropic` call reported that call once and the
+crew without LLM spans, until `["crewai", "langchain", "anthropic"]` was named.
 
 CrewAI's own telemetry runs on a private `TracerProvider`. It never installs a
 global one, so it doesn't collide with Argus's. Its opt-out does:
