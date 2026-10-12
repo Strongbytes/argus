@@ -309,27 +309,61 @@ class TestCuratedDetectionForReal:
 
         assert [type(i).__name__ for i in result] == ["LangChainInstrumentor"]
 
+    @pytest.mark.parametrize("provider", ["openai", "anthropic"])
     @pytest.mark.parametrize("key", ["langchain", "langgraph"])
-    def test_langchain_does_not_double_up_with_openai(
-        self, key, frameworks_in_use
+    def test_langchain_does_not_double_up_with_a_provider(
+        self, key, provider, frameworks_in_use
     ):
-        # ``langchain-openai`` calls the OpenAI SDK, so the standalone
-        # instrumentor would add a second LLM span under LangChain's own, with
-        # the same token counts.
-        frameworks_in_use(key, "openai")
+        # ``langchain-openai`` and ``langchain-anthropic`` call the provider
+        # SDKs, so the standalone instrumentor would report each model call a
+        # second time, with the same token counts.
+        frameworks_in_use(key, provider)
 
         result = detection.resolve_instrumentors(None)
 
         assert [type(i).__name__ for i in result] == ["LangChainInstrumentor"]
 
-    def test_explicit_keys_can_still_pair_langchain_with_openai(self):
+    @pytest.mark.parametrize(
+        ("provider", "instrumentor"),
+        [
+            ("openai", "OpenAIInstrumentor"),
+            ("anthropic", "AnthropicInstrumentor"),
+        ],
+    )
+    def test_explicit_keys_can_still_pair_langchain_with_a_provider(
+        self, provider, instrumentor
+    ):
         # The documented escape hatch for a node that calls the raw client:
         # supersession shapes auto-detection only, never an explicit list.
-        result = detection.resolve_instrumentors(["langchain", "openai"])
+        result = detection.resolve_instrumentors(["langchain", provider])
 
         assert [type(i).__name__ for i in result] == [
             "LangChainInstrumentor",
-            "OpenAIInstrumentor",
+            instrumentor,
+        ]
+
+    def test_the_anthropic_client_alone_turns_on_its_instrumentor(
+        self, frameworks_in_use
+    ):
+        frameworks_in_use("anthropic")
+
+        result = detection.resolve_instrumentors(None)
+
+        assert [type(i).__name__ for i in result] == ["AnthropicInstrumentor"]
+
+    def test_the_claude_agent_sdk_and_the_anthropic_client_are_both_kept(
+        self, frameworks_in_use
+    ):
+        # Two Anthropic products with no overlap: the Agent SDK drives the
+        # Claude Code CLI in a subprocess and never calls the ``anthropic``
+        # package, so neither key supersedes the other.
+        frameworks_in_use("claude", "anthropic")
+
+        result = detection.resolve_instrumentors(None)
+
+        assert [type(i).__name__ for i in result] == [
+            "ClaudeAgentSDKInstrumentor",
+            "AnthropicInstrumentor",
         ]
 
     def test_a_crew_gets_its_llm_spans_from_the_openai_key(
@@ -484,6 +518,13 @@ class TestClassesForKeys:
             "openinference.instrumentation.crewai:CrewAIInstrumentor"
         ]
 
+    def test_anthropic_resolves_to_its_instrumentor(self, monkeypatch):
+        monkeypatch.setattr(detection, "_load", lambda path: path)
+
+        assert detection._classes_for_keys(["anthropic"]) == [
+            "openinference.instrumentation.anthropic:AnthropicInstrumentor"
+        ]
+
 
 class TestLoad:
     """The lazy-import seam, run rather than stubbed.
@@ -565,6 +606,27 @@ class TestAutoKeys:
         )
 
         assert detection._auto_keys() == ["langchain", "langgraph"]
+
+    @pytest.mark.parametrize("key", ["langchain", "langgraph"])
+    def test_langchain_drops_standalone_anthropic(self, key, monkeypatch):
+        # ``langchain-anthropic`` imports ``anthropic``, so a ``ChatAnthropic``
+        # app looks like this to detection. ``langgraph`` is checked on its own
+        # because its entry carries its own ``supersedes``.
+        detector = detection._BY_KEY[key].detector
+        monkeypatch.setattr(
+            detection,
+            "_module_loaded",
+            lambda name: name in {detector, "anthropic"},
+        )
+
+        assert detection._auto_keys() == [key]
+
+    def test_keeps_anthropic_when_it_is_the_only_framework(self, monkeypatch):
+        monkeypatch.setattr(
+            detection, "_module_loaded", lambda name: name == "anthropic"
+        )
+
+        assert detection._auto_keys() == ["anthropic"]
 
     def test_crewai_keeps_the_openai_key(self, monkeypatch):
         monkeypatch.setattr(

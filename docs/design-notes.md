@@ -722,19 +722,42 @@ instrumented. The price is breadth: anything that imports `langchain_core`,
 including a library pulling it in as a dependency, now selects the instrumentor.
 Detection prefers `sys.modules`, so only a real import does.
 
-Both entries supersede `openai`, and unlike Agno's this is not cosmetic.
-`langchain-openai` calls the OpenAI SDK, so with the OpenAI instrumentor also on,
-every model call is reported twice -- once as LangChain's LLM span, once as an
-OpenAI one, each with the same token counts, so a backend summing usage counts it
-twice. The second does not nest under the first: `LangChainInstrumentor`
-deliberately never attaches its spans to the OpenTelemetry context (it is a
-callback system, and a context attached there may never be detached), so the
-OpenAI span has no parent to find and starts a trace of its own. The run is
-double-counted *and* split. Dropping `openai` costs a node that calls the raw
-client directly its span, and `instrument=["langchain", "openai"]` brings it back
--- supersession only shapes auto-detection, never an explicit list -- at the price
-of that duplication for every LangChain model call. The same property means a span
-of your own started inside a LangChain node will not nest under the node either.
+Both entries supersede `openai` and `anthropic`, and unlike Agno's this is not
+cosmetic. `langchain-openai` calls the OpenAI SDK and `langchain-anthropic` the
+Anthropic one, so with a provider instrumentor also on, every model call is
+reported twice -- once as LangChain's LLM span, once as the provider's, each with
+the same token counts, so a backend summing usage counts it twice. The second does
+not nest under the first: `LangChainInstrumentor` deliberately never attaches its
+spans to the OpenTelemetry context (it is a callback system, and a context
+attached there may never be detached), so the provider span has no parent to find
+and starts a trace of its own. The run is double-counted *and* split. Dropping the
+provider keys costs a node that calls the raw client directly its span, and
+`instrument=["langchain", "openai"]` (or `"anthropic"`) brings it back --
+supersession only shapes auto-detection, never an explicit list -- at the price of
+that duplication for every LangChain model call on that provider. The same
+property means a span of your own started inside a LangChain node will not nest
+under the node either.
+
+### Two Anthropic keys
+
+`claude` is the Claude Agent SDK and `anthropic` is the Anthropic API SDK, and
+neither supersedes the other. The Agent SDK doesn't depend on `anthropic`: it
+drives the Claude Code CLI as a subprocess, so its model calls happen in another
+process, out of reach of `AnthropicInstrumentor` anyway. A script that uses both
+is making two kinds of call, and gets both keys.
+
+The OpenAI Agents SDK doesn't supersede `anthropic` either. It reaches Claude
+through LiteLLM, whose Anthropic provider calls the API over `httpx` rather than
+through the `anthropic` package, so there is no second span to suppress. This
+was checked against `openai-agents` 0.23 and LiteLLM 1.83: importing the LiteLLM
+model doesn't load `anthropic`, and LiteLLM's only imports of it are a legacy
+token counter and a logging integration.
+
+`AnthropicInstrumentor` wraps `Messages.create`, `.stream` and `.parse` (and
+their async and `beta` counterparts) on the class, so `anthropic` declares no
+free functions. Checked with `anthropic` 1.13 and the instrumentor 3.0 against a
+stub server: a raw client call is one `messages.create` LLM span with token
+counts, and `ChatAnthropic` under auto-detection is one `ChatAnthropic` span.
 
 ### CrewAI: wrapper mode, OpenAI through its own key
 
@@ -750,11 +773,13 @@ else, so there is no channel for per-instrumentor options to begin with.
 The LLM spans come from `OpenAIInstrumentor`. CrewAI depends on `openai`, its
 native OpenAI provider calls the SDK, and so do the OpenAI-compatible providers
 built on it (OpenRouter, DeepSeek, Ollama, vLLM). A crew on Anthropic, Gemini,
-Bedrock or LiteLLM gets its structure spans and no LLM spans. Covering those
-means turning an instrumentor on only when its provider is in use -- the
-Anthropic one when `anthropic` is imported, say -- which an entry cannot express:
-`instrumentors` is unconditional. That is deferred rather than worked around, and
-the README states the limit.
+Bedrock or LiteLLM gets its structure spans and no LLM spans. The `anthropic` key
+doesn't rescue a Claude crew: CrewAI imports its Anthropic provider lazily, when
+an agent with a Claude model is built, which in the usual script order is after
+`init` has already looked at `sys.modules`. Covering that means a framework
+turning on its provider keys by importability, which an entry cannot express
+today. That is deferred rather than worked around, and the README states the
+limit.
 
 Unlike Agno's entry, `crewai`'s doesn't list `OpenAIInstrumentor`. It doesn't
 need to: `import crewai` imports `openai`, and `openai` is a hard dependency, so

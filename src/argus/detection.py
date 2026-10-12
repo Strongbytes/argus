@@ -84,6 +84,7 @@ InstrumentKey = Literal[
     "claude",
     "agno",
     "openai",
+    "anthropic",
     "langchain",
     "langgraph",
     "crewai",
@@ -134,7 +135,9 @@ _FRAMEWORKS: tuple[_Framework, ...] = (
         ),
         # Load-bearing: this instrumentor covers OpenAI client calls itself, so
         # keeping the standalone key alongside it really would instrument them
-        # twice.
+        # twice. Not ``anthropic``: the SDK reaches Claude through LiteLLM, which
+        # calls the Anthropic API over ``httpx`` rather than the ``anthropic``
+        # package, so there is nothing for that key to double up.
         supersedes=("openai",),
     ),
     _Framework(
@@ -181,26 +184,27 @@ _FRAMEWORKS: tuple[_Framework, ...] = (
     # place as a key -- an explicit ``instrument="langgraph"`` consults no
     # detector at all.
     #
-    # Load-bearing, unlike Agno's: ``langchain-openai`` calls the OpenAI SDK
-    # underneath, and the standalone OpenAI instrumentor would report the same
-    # call a second time -- same token counts, so a backend would count them
-    # twice. LangChain's tracer never attaches its spans to the OpenTelemetry
-    # context, so the second one does not nest under the first: it arrives as a
-    # trace of its own. The cost of dropping it is that a node calling the raw
-    # ``openai`` client directly goes untraced; ``instrument=["langchain",
-    # "openai"]`` opts back in, with that duplication for every LangChain model
-    # call.
+    # Load-bearing, unlike Agno's: ``langchain-openai`` and
+    # ``langchain-anthropic`` call the provider SDKs underneath, and the
+    # standalone OpenAI or Anthropic instrumentor would report the same call a
+    # second time -- same token counts, so a backend would count them twice.
+    # LangChain's tracer never attaches its spans to the OpenTelemetry context,
+    # so the second one does not nest under the first: it arrives as a trace of
+    # its own. The cost of dropping them is that a node calling the raw
+    # ``openai`` or ``anthropic`` client directly goes untraced;
+    # ``instrument=["langchain", "openai"]`` opts back in, with that duplication
+    # for every LangChain model call on that provider.
     _Framework(
         "langchain",
         "langchain_core",
         ("openinference.instrumentation.langchain:LangChainInstrumentor",),
-        supersedes=("openai",),
+        supersedes=("openai", "anthropic"),
     ),
     _Framework(
         "langgraph",
         "langgraph",
         ("openinference.instrumentation.langchain:LangChainInstrumentor",),
-        supersedes=("openai",),
+        supersedes=("openai", "anthropic"),
     ),
     # CrewAI's instrumentor wraps methods only -- ``Crew.kickoff``,
     # ``Task._execute_core``, ``Agent.kickoff``, ``Flow``'s entry points, the
@@ -229,6 +233,15 @@ _FRAMEWORKS: tuple[_Framework, ...] = (
         "crewai",
         "crewai",
         ("openinference.instrumentation.crewai:CrewAIInstrumentor",),
+    ),
+    # The Anthropic API SDK, used directly -- not ``claude``, which is the Claude
+    # Agent SDK. That one doesn't depend on ``anthropic``: it drives the Claude
+    # Code CLI as a subprocess, so its model calls happen in another process and
+    # the two keys never overlap. A script using both gets both.
+    _Framework(
+        "anthropic",
+        "anthropic",
+        ("openinference.instrumentation.anthropic:AnthropicInstrumentor",),
     ),
     _Framework(
         "openai",

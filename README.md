@@ -67,6 +67,7 @@ pip install "argus-trace[langchain]"       # LangChain
 pip install "argus-trace[langgraph]"       # LangGraph
 pip install "argus-trace[crewai]"          # CrewAI
 pip install "argus-trace[openai]"          # OpenAI client, used directly
+pip install "argus-trace[anthropic]"       # Anthropic client, used directly
 pip install "argus-trace[otlp]"            # remote OTLP/HTTP export
 ```
 
@@ -445,7 +446,13 @@ use (preferring already-imported modules) and avoiding double-instrumentation:
 | `langchain`     | `langchain_core`   | `LangChainInstrumentor`                     |
 | `langgraph`     | `langgraph`        | `LangChainInstrumentor`                     |
 | `crewai`        | `crewai`           | `CrewAIInstrumentor`                        |
+| `anthropic`     | `anthropic`        | `AnthropicInstrumentor`                     |
 | `openai`        | `openai`           | `OpenAIInstrumentor`                        |
+
+`claude` is the Claude Agent SDK and `anthropic` is the Anthropic API SDK. The
+Agent SDK runs its model calls in a Claude Code subprocess rather than through
+the `anthropic` package, so the two never overlap, and a script using both gets
+both.
 
 `langchain` and `langgraph` are two names for one instrumentor. OpenInference has
 no separate LangGraph instrumentor: `LangChainInstrumentor` hooks the
@@ -455,14 +462,16 @@ keys off `langchain_core` rather than `langchain`, because LangGraph and
 `langchain-openai` work without the `langchain` package but never without
 `langchain-core`. If a script imports both, the instrumentor is turned on once.
 
-LangChain's model packages (`langchain-openai`, say) call the OpenAI SDK
-underneath, so detecting `langchain` or `langgraph` drops the standalone `openai`
-key. Keeping it would report every model call twice -- same token counts, and as a
-separate trace, since LangChain's spans are not attached to the OpenTelemetry
-context the OpenAI ones start from. The cost is that a node calling the raw
-`openai` client directly is not traced. `instrument=["langchain", "openai"]` turns
-it back on -- an explicit list is never trimmed -- and accepts that duplication for
-every LangChain model call.
+LangChain's model packages call the provider SDKs underneath -- `ChatOpenAI`
+(`langchain-openai`) the OpenAI one, `ChatAnthropic` (`langchain-anthropic`) the
+Anthropic one -- so detecting `langchain` or `langgraph` drops the standalone
+`openai` and `anthropic` keys. Keeping them would report every model call twice --
+same token counts, and as a separate trace, since LangChain's spans are not
+attached to the OpenTelemetry context the provider ones start from. The cost is
+that a node calling the raw `openai` or `anthropic` client directly is not traced.
+`instrument=["langchain", "openai"]` (or `"anthropic"`) turns it back on -- an
+explicit list is never trimmed -- and accepts that duplication for every LangChain
+model call on that provider.
 
 CrewAI's instrumentor records crews, tasks, agents, tools and flows, but no model
 calls. Those come from the `openai` key, which auto-detection picks alongside
@@ -547,7 +556,7 @@ class-based framework never triggers it. Only module-level bindings are found (t
 shape a `from` import produces); the reasoning and the limits are in [the design
 notes](docs/design-notes.md#stale-bindings-from-an-import-before-init).
 
-Of the seven keys, `claude` is currently the only one with a free function to get
+Of the eight keys, `claude` is currently the only one with a free function to get
 wrong: `claude_agent_sdk.query`. The class-based entry points -- including
 `ClaudeSDKClient` -- are unaffected whatever the import order.
 

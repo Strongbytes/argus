@@ -426,10 +426,12 @@ class TestTheRealRegistry:
         # LangChain and LangGraph are no different: the instrumentor wraps
         # ``BaseCallbackManager.__init__``, a method. CrewAI's wraps
         # ``Crew.kickoff``, ``Task._execute_core`` and the like, all methods too.
+        # Anthropic's wraps ``Messages.create`` and its siblings on the class.
         for key in (
             "openai_agents",
             "agno",
             "openai",
+            "anthropic",
             "langchain",
             "langgraph",
             "crewai",

@@ -5,7 +5,7 @@ its rationale is in `docs/design-notes.md`. This is a working reference, not use
 documentation: when the work lands, the rationale moves to the design notes and
 this file can be deleted.
 
-1. [A simple `anthropic` key](#1-a-simple-anthropic-key)
+1. [A simple `anthropic` key](#1-a-simple-anthropic-key) - DONE
 2. [Agno + Anthropic (and the Agno double count)](#2-agno--anthropic-and-the-agno-double-count)
 3. [CrewAI + Anthropic](#3-crewai--anthropic)
 4. [CrewAI + LangChain / LangGraph](#4-crewai--langchain--langgraph)
@@ -25,15 +25,15 @@ No registry entry pairs an instrumentor it doesn't own. A framework entry lists
 only its own instrumentor, and relates to the provider keys (`openai`,
 `anthropic`) in one of three ways:
 
-| Framework's instrumentor...         | Entry declares                    | Keys                                              |
-| ----------------------------------- | --------------------------------- | ------------------------------------------------- |
-| records the model calls itself      | `supersedes` the provider keys    | `openai_agents`, `agno`, `langchain`, `langgraph` |
-| records structure only              | `companions`: the provider keys   | `crewai`                                          |
-| has no Python provider SDK under it | neither                           | `claude`                                          |
+| Framework's instrumentor...         | Entry declares                  | Keys                                              |
+| ----------------------------------- | ------------------------------- | ------------------------------------------------- |
+| records the model calls itself      | `supersedes` the provider keys  | `openai_agents`, `agno`, `langchain`, `langgraph` |
+| records structure only              | `companions`: the provider keys | `crewai`                                          |
+| has no Python provider SDK under it | neither                         | `claude`                                          |
 
 Explicit lists stay exact: never trimmed by supersession, never expanded by
-companions. In one sentence: *provider spans are on unless a detected framework
-already records the model calls.*
+companions. In one sentence: _provider spans are on unless a detected framework
+already records the model calls._
 
 Patching is process-wide, so supersession is too. In a mixed run, a
 structure-only framework (CrewAI) loses its LLM spans whenever a self-recording
@@ -80,7 +80,7 @@ OpenAI one.
 **Changes**
 
 - `detection.py`: `"anthropic"` in `InstrumentKey`. Entry `("anthropic",
-  "anthropic", ("openinference.instrumentation.anthropic:AnthropicInstrumentor",))`,
+"anthropic", ("openinference.instrumentation.anthropic:AnthropicInstrumentor",))`,
   placed with `openai` at the end. `langchain` and `langgraph` gain `"anthropic"`
   in `supersedes`.
 - `pyproject.toml`: `anthropic = ["openinference-instrumentation-anthropic"]`.
@@ -114,17 +114,18 @@ with tokens. `ChatAnthropic` under LangChain gives one LLM span.
   `agents_instrumentation/agents/agno/agent_with_tool_oai.py`'s shape (`arun`, a
   tool, a bare `init`):
 
-  ```text
-  Agent.arun [AGENT]
-    OpenAIChat.ainvoke [LLM] provider=OpenAI prompt_tokens=11
-      ChatCompletion [LLM] prompt_tokens=11       <- paired OpenAIInstrumentor
-    get_weather [TOOL]
-    OpenAIChat.ainvoke [LLM] provider=OpenAI prompt_tokens=11
-      ChatCompletion [LLM] prompt_tokens=11       <- again
-  ```
+    ```text
+    Agent.arun [AGENT]
+      OpenAIChat.ainvoke [LLM] provider=OpenAI prompt_tokens=11
+        ChatCompletion [LLM] prompt_tokens=11       <- paired OpenAIInstrumentor
+      get_weather [TOOL]
+      OpenAIChat.ainvoke [LLM] provider=OpenAI prompt_tokens=11
+        ChatCompletion [LLM] prompt_tokens=11       <- again
+    ```
 
-  The spans nest, but a backend summing tokens over LLM spans counts each call
-  twice.
+    The spans nest, but a backend summing tokens over LLM spans counts each call
+    twice.
+
 - An Agno agent on `Claude` already gets exactly one LLM span (`Claude.invoke`,
   provider=Anthropic, tokens). Turning on the Anthropic instrumentor as well
   (tried via `instrument="all"`) nests a second `messages.create` LLM span with
@@ -145,7 +146,7 @@ with tokens. `ChatAnthropic` under LangChain gives one LLM span.
 - **What users see:** an Agno run on OpenAI loses the nested `ChatCompletion`
   span. Coverage is unchanged and tokens are counted once. The raw request
   parameters that span carried are available through `instrument=["agno",
-  "openai"]`, accepting the double count. `instrument="agno"` now resolves to one
+"openai"]`, accepting the double count. `instrument="agno"` now resolves to one
   instrumentor. A raw `openai` / `anthropic` client call inside an Agno script
   goes untraced, the same trade as LangChain's. Agno + LangChain stops
   duplicating `ChatOpenAI` calls as a side effect.
@@ -259,7 +260,7 @@ in place.
   importable → LangChain + CrewAI only.
 - Update the existing tests and docs that name only `openai` in this
   combination, and the escape hatch: `instrument=["crewai", "langchain",
-  "anthropic"]` for a Claude crew.
+"anthropic"]` for a Claude crew.
 
 **Verify:** a Claude crew plus a `ChatAnthropic` call: one LLM span for
 `ChatAnthropic`, none for the crew's model calls; the explicit list restores
@@ -301,7 +302,7 @@ still validates keys at runtime.
 valid: it names the project "langchain" and auto-detects. It reads as if it
 picked the LangChain instrumentor, and `agents_instrumentation` writes every
 example that way. A warning would fire on all of them, so the docs sentence
-covers it instead. **Open question:** warn when `project` equals a key *and*
+covers it instead. **Open question:** warn when `project` equals a key _and_
 `instrument` is unset? It is noisy for the examples, but they could pass
 `instrument=` or use a neutral project name.
 
@@ -318,7 +319,7 @@ were already wrong start raising, so no `BREAKING CHANGE:` footer.
 
 ## 6. Nesting work started inside LangChain / LangGraph (optional)
 
-**The problem.** Anything instrumented that runs *inside* LangChain or
+**The problem.** Anything instrumented that runs _inside_ LangChain or
 LangGraph code (a graph node, a tool, a `RunnableLambda`) starts a new trace
 instead of nesting under the LangChain span it runs in. That covers a CrewAI
 crew, an Agno agent, an OpenAI Agents SDK run, or a raw client call when its key
@@ -373,24 +374,25 @@ apply.
 - **A. Docs only.** Show the two-line escape hatch in `docs/examples.md`. No
   code, but users must know about it. They also need to handle the trap
   `get_current_span()` sets: it returns `None` outside a LangChain run (or
-  when LangChain isn't instrumented), and `use_span(None)` would *cut* the
+  when LangChain isn't instrumented), and `use_span(None)` would _cut_ the
   block off from any outer parent rather than do nothing.
 - **B. A small Argus helper (recommended, if you do this at all).** A context
   manager, e.g. `argus.nest_in_langchain()` (name open), used inside a node or
   tool:
 
-  ```python
-  def count(state):
-      with argus.nest_in_langchain():
-          return {"counts": crew.kickoff().raw}
-  ```
+    ```python
+    def count(state):
+        with argus.nest_in_langchain():
+            return {"counts": crew.kickoff().raw}
+    ```
 
-  It does nothing when the LangChain instrumentor isn't installed or active, or
-  when no run is current (`None`). Otherwise it is `use_span(span,
-  end_on_exit=False)`. It is explicit, small, testable, and doesn't depend on
-  LangGraph internals. Only a sync node was tried. Async nodes and parallel
-  branches (which LangGraph runs on worker threads) should work, since
-  LangChain copies its context variable into those threads, but verify them.
+    It does nothing when the LangChain instrumentor isn't installed or active, or
+    when no run is current (`None`). Otherwise it is `use_span(span,
+end_on_exit=False)`. It is explicit, small, testable, and doesn't depend on
+    LangGraph internals. Only a sync node was tried. Async nodes and parallel
+    branches (which LangGraph runs on worker threads) should work, since
+    LangChain copies its context variable into those threads, but verify them.
+
 - **C. Automatic.** Wrap LangGraph's node runner (`RunnableCallable` in
   `langgraph._internal`), `RunnableLambda` and `BaseTool.run` so that every
   user function body runs with its LangChain span attached. No user code, but
@@ -421,10 +423,10 @@ a raw client call inside a node isn't recorded at all (LangChain supersedes
 
 - The dev group has no LangChain, so fake
   `openinference.instrumentation.langchain.get_current_span`:
-  - when it returns a span, a span started inside the block is its child;
-  - when it returns `None`, a span started inside keeps the *outer* parent
-    (the trap above);
-  - when the import fails, the block runs and nothing changes.
+    - when it returns a span, a span started inside the block is its child;
+    - when it returns `None`, a span started inside keeps the _outer_ parent
+      (the trap above);
+    - when the import fails, the block runs and nothing changes.
 - Works inside `async def`.
 - Verify for real in a separate environment, as with CrewAI: the
   graph-runs-a-crew script above gives one trace with the crew under `count`.
@@ -458,14 +460,14 @@ changelog reads cleanly:
   double counting, but can't help LangChain, whose spans don't nest.
 - CrewAI's framework adapters (`LangGraphAgentAdapter`, `OpenAIAgentAdapter`).
   They are broken upstream, so there is nothing for Argus to do.
-  - They can't be created: `BaseAgent` gained abstract methods the adapters
-    don't implement. It is two methods since 1.0 and three since 1.8, and still
-    broken in 1.15.26, the latest release.
-  - With those methods stubbed, three more problems surface in turn:
-    - The `llm` field rejects a `ChatOpenAI`.
-    - The task runner reads an `agent.last_messages` the adapter doesn't have.
-    - The CrewAI tools never reach the graph.
-  - Where it got far enough, CrewAI's task span already contained the LangGraph
-    spans, so no Argus change should be needed once upstream fixes them. Until
-    then, a crew reaches LangGraph through a tool
-    (`crew_with_langgraph_tool_oai.py`).
+    - They can't be created: `BaseAgent` gained abstract methods the adapters
+      don't implement. It is two methods since 1.0 and three since 1.8, and still
+      broken in 1.15.26, the latest release.
+    - With those methods stubbed, three more problems surface in turn:
+        - The `llm` field rejects a `ChatOpenAI`.
+        - The task runner reads an `agent.last_messages` the adapter doesn't have.
+        - The CrewAI tools never reach the graph.
+    - Where it got far enough, CrewAI's task span already contained the LangGraph
+      spans, so no Argus change should be needed once upstream fixes them. Until
+      then, a crew reaches LangGraph through a tool
+      (`crew_with_langgraph_tool_oai.py`).

@@ -493,6 +493,7 @@ class TestNoInstrumentorsWarning:
         assert "langgraph" in message
         assert "crewai" in message
         assert "openai" in message
+        assert "anthropic" in message
 
     def test_no_warning_when_instrument_is_explicitly_empty(
         self, monkeypatch, recording_exporter, recwarn

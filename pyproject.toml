@@ -43,9 +43,10 @@ crewai = [
     "openinference-instrumentation-crewai",
     "openinference-instrumentation-openai",
 ]
-# Matches the curated ``openai`` key, for a script calling the OpenAI client
-# directly rather than through an agent framework.
+# Match the curated ``openai`` and ``anthropic`` keys, for a script calling a
+# provider client directly rather than through an agent framework.
 openai = ["openinference-instrumentation-openai"]
+anthropic = ["openinference-instrumentation-anthropic"]
 otlp = ["opentelemetry-exporter-otlp-proto-http>=1.30"]
 
 # The tooling for working on Argus itself, kept in a PEP 735 dependency group

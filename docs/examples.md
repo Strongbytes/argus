@@ -20,6 +20,7 @@ the thing you're trying to do.
 - [LangChain and LangGraph](#langchain-and-langgraph)
 - [CrewAI](#crewai)
 - [The OpenAI client, used directly](#the-openai-client-used-directly)
+- [The Anthropic client, used directly](#the-anthropic-client-used-directly)
 - [Choosing the instrumentors yourself](#choosing-the-instrumentors-yourself)
 - [Every argument at once](#every-argument-at-once)
 - [Where the trace files go](#where-the-trace-files-go)
@@ -208,21 +209,21 @@ Detection keys off `langchain_core`, so a LangGraph app that never imports the
 
 Any provider's chat model works, not just OpenAI's: the instrumentor sits on
 `langchain-core`, so `ChatAnthropic` (`langchain-anthropic`) and the rest get LLM
-spans with model name and token counts the same way. The `openai` handling below
-is specific to OpenAI only because OpenAI is the one provider SDK Argus also
-instruments itself; there is nothing to double up with for Claude. If a script also
-imports `claude_agent_sdk`, Argus turns on that instrumentor as well, and you need
-both extras (`argus-trace[langgraph,claude]`).
+spans with model name and token counts the same way. If a script also imports
+`claude_agent_sdk`, Argus turns on that instrumentor as well, and you need both
+extras (`argus-trace[langgraph,claude]`).
 
-Detecting either drops the standalone `openai` key. `ChatOpenAI` calls the OpenAI
-SDK underneath, and the OpenAI instrumentor would report each of those calls a
-second time: same token counts, and in a trace of its own rather than nested under
-LangChain's span. If a node calls the raw `openai` client directly and you want
-that traced, ask for both -- knowing that every `ChatOpenAI` call is then reported
-twice as well:
+Detecting either drops the standalone `openai` and `anthropic` keys. `ChatOpenAI`
+and `ChatAnthropic` call the provider SDKs underneath, and the provider
+instrumentor would report each of those calls a second time: same token counts,
+and in a trace of its own rather than nested under LangChain's span. If a node
+calls the raw `openai` or `anthropic` client directly and you want that traced,
+ask for both -- knowing that every LangChain model call on that provider is then
+reported twice as well:
 
 ```python
 argus.init("research-agent", instrument=["langchain", "openai"])
+argus.init("research-agent", instrument=["langchain", "anthropic"])
 ```
 
 Parallel branches, `ainvoke` and `stream`/`astream` all trace correctly, and a
@@ -307,6 +308,28 @@ client.chat.completions.create(
 )
 ```
 
+## The Anthropic client, used directly
+
+The same for the Anthropic SDK — `pip install "argus-trace[anthropic]"`:
+
+```python
+import argus
+from anthropic import Anthropic
+
+argus.init("prompt-lab")
+
+client = Anthropic()
+client.messages.create(
+    model="claude-sonnet-4-5",
+    max_tokens=256,
+    messages=[{"role": "user", "content": "Two facts about Argus."}],
+)
+```
+
+Each call is a `messages.create` LLM span with the model name and token counts.
+This is the `anthropic` key, not `claude`: that one is the [Claude Agent
+SDK](#claude-agent-sdk), which doesn't use this package.
+
 ## Choosing the instrumentors yourself
 
 Pass `instrument=` when detection would guess wrong, or when you want the
@@ -320,7 +343,7 @@ argus.init("no-framework", instrument=[])               # instrument nothing
 ```
 
 The curated keys are `openai_agents`, `claude`, `agno`, `langchain`, `langgraph`,
-`crewai`, and `openai` (the README has the table of what each detects and
+`crewai`, `anthropic`, and `openai` (the README has the table of what each detects and
 applies). A key that isn't one of them
 raises `ValueError` listing the ones that are, so a typo fails at your `init`
 line instead of producing a run with nothing instrumented.
