@@ -9,7 +9,7 @@ this file can be deleted.
 2. [Agno + Anthropic (and the Agno double count)](#2-agno--anthropic-and-the-agno-double-count) - DONE
 3. [CrewAI + Anthropic](#3-crewai--anthropic) - DONE
 4. [CrewAI + LangChain / LangGraph](#4-crewai--langchain--langgraph)
-5. [`init` rejects a project that isn't a string](#5-init-rejects-a-project-that-isnt-a-string)
+5. [`init` rejects a project that isn't a string](#5-init-rejects-a-project-that-isnt-a-string) - DONE
 6. [Nesting work started inside LangChain / LangGraph (optional)](#6-nesting-work-started-inside-langchain--langgraph-optional)
 
 Findings for items 1 to 4 were checked on 2026-10-09 with real Agno 3.1.2,

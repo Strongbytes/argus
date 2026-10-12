@@ -165,6 +165,12 @@ pytest --cov --cov-report=html     # also write an htmlcov/ report to browse
 | `exporters`   | `[FileSpanExporter]` | Replace the default sink with your own OpenTelemetry exporters. See [Custom exporters](#custom-exporters).                            |
 | `otlp`        | `None`               | Enable remote OTLP/HTTP export alongside the others. `True` takes the endpoint and key from the environment; an `OtlpConfig(...)` sets them (plus headers and timeout) explicitly. See below. |
 
+The first argument is the project name, and it is the only positional one: the
+instrumentors go in `instrument=`. `argus.init(["crewai", "openai"])` raises
+`TypeError` rather than naming a project after the list and auto-detecting, and
+`argus.init("langchain")` names a project "langchain" -- it doesn't select the
+LangChain instrumentor.
+
 `project` and `service` land on every span as resource attributes, alongside a
 third Argus stamps itself: `argus.version`, the version of Argus that recorded
 the trace, so a trace file read later says which release produced it.

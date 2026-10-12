@@ -84,6 +84,73 @@ class TestInit:
         assert attributes["argus.version"] == argus.__version__
 
 
+class TestProjectMustBeAString:
+    """``init(["crewai", "openai"])`` is the mistake: keys passed as the project.
+
+    Nothing else would fail -- OpenTelemetry accepts a string-array attribute,
+    and ``instrument`` left as ``None`` auto-detects -- so the run would trace
+    with the wrong selection and say nothing.
+    """
+
+    @pytest.mark.parametrize(
+        "project", [["crewai", "openai"], ("crewai", "openai"), None]
+    )
+    def test_a_non_string_project_raises_and_points_at_instrument(
+        self, project, use_instrumentors, recording_exporter
+    ):
+        inst = make_instrumentor()
+        received = use_instrumentors(inst)
+
+        with pytest.raises(TypeError, match="instrument=") as excinfo:
+            argus.init(project, exporters=[recording_exporter])
+
+        assert type(project).__name__ in str(excinfo.value)
+        # Raised before anything was set up: no session, no detection, nothing
+        # patched.
+        assert session_module._session is None
+        assert received == []
+        assert inst.instrument_calls == []
+
+    def test_it_is_raised_before_dotenv_is_loaded(
+        self, monkeypatch, use_instrumentors, recording_exporter
+    ):
+        use_instrumentors()
+        loads = []
+        monkeypatch.setattr(
+            session_module, "_load_dotenv", lambda: loads.append(True)
+        )
+
+        with pytest.raises(TypeError):
+            argus.init(["crewai"], exporters=[recording_exporter])
+
+        assert loads == []
+
+    def test_it_is_raised_ahead_of_the_reinit_guard(
+        self, use_instrumentors, recording_exporter
+    ):
+        # A second, wrong call must not be swallowed by the warning that
+        # returns the active session.
+        use_instrumentors()
+        session = argus.init("proj", exporters=[recording_exporter])
+
+        with pytest.raises(TypeError):
+            argus.init(["crewai"], exporters=[recording_exporter])
+
+        assert session_module._session is session
+
+    def test_a_project_named_like_a_key_is_still_a_project(
+        self, use_instrumentors, recording_exporter
+    ):
+        # Valid, and what the examples write: it names the project and
+        # auto-detects, rather than selecting the LangChain instrumentor.
+        received = use_instrumentors()
+
+        session = argus.init("langchain", exporters=[recording_exporter])
+
+        assert session.project == "langchain"
+        assert received == [None]
+
+
 class TestTheDocumentedOneLiner:
     """The README's headline flow, end to end, through the real default sink.
 

@@ -522,7 +522,8 @@ def init(
 
     Args:
         project: Argus's logical run umbrella, stamped on every span as
-            ``argus.project``. A project may span several services.
+            ``argus.project``. A project may span several services. It is the
+            only positional argument; instrumentors go in ``instrument=``.
         service: Identity of the observed application, stamped as the
             OpenTelemetry ``service.name``. Defaults to the running script's
             name, falling back to ``"session"`` for a REPL, an embedded
@@ -561,7 +562,9 @@ def init(
         A :class:`Session`; traces flush automatically on process exit.
 
     Raises:
-        TypeError: If ``otlp`` is neither a bool, an
+        TypeError: If ``project`` isn't a ``str`` -- most likely a list of keys
+            meant for ``instrument=`` -- checked before anything else runs. Or
+            if ``otlp`` is neither a bool, an
             :class:`~argus.exporters.otlp.OtlpConfig`, nor ``None``.
         ValueError: If ``instrument`` names a key the curated registry does not
             know (see :func:`~argus.detection.resolve_instrumentors`), or if
@@ -573,6 +576,14 @@ def init(
             ``docs/design-notes.md``, "No default OTLP endpoint").
     """
     global _session
+    # Checked at run time despite the annotation, and before anything else: an
+    # untyped ``init(["crewai", "openai"])`` would otherwise stamp the list as
+    # ``argus.project`` and auto-detect instead, with nothing failing.
+    if not isinstance(project, str):
+        raise TypeError(
+            f"project must be a string, got {type(project).__name__}. To "
+            "choose instrumentors, pass them as instrument=[...]."
+        )
     if _session is not None:
         _warn_reinit(_session, project)
         return _session
